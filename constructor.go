@@ -145,8 +145,18 @@ func (n *constructorNode) String() string {
 
 // Call calls this constructor if it hasn't already been called and
 // injects any values produced by it into the provided container.
+//
+// If a value group transaction is in progress, the values produced by
+// this constructor are staged in that transaction instead: they become
+// visible to readers in the transaction immediately, but are committed to
+// the container only if the whole group builds successfully.
 func (n *constructorNode) Call(c containerStore) (err error) {
 	if n.called {
+		return nil
+	}
+
+	tx := n.s.activeGroupTransaction()
+	if tx != nil && tx.isCalled(n) {
 		return nil
 	}
 
@@ -198,6 +208,14 @@ func (n *constructorNode) Call(c containerStore) (err error) {
 	results := c.invoker()(reflect.ValueOf(n.ctor), args)
 	if err = n.resultList.ExtractList(receiver, false /* decorating */, results); err != nil {
 		return errConstructorFailed{Func: n.location, Reason: err}
+	}
+
+	if tx != nil {
+		// A value group is being built transactionally: stage the
+		// results so that they are rolled back if any element of the
+		// group fails to build.
+		tx.stage(n, n.s, receiver)
+		return nil
 	}
 
 	// Commit the result to the original container that this constructor

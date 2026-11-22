@@ -5,7 +5,14 @@ The format is based on [Keep a Changelog](http://keepachangelog.com/en/1.0.0/)
 and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.html).
 
 ## Unreleased
-- No changes yet.
+
+### Changed
+- Value groups are now built transactionally: a single resolution freezes
+  the set of providers for a group and their order, and the group is
+  delivered only after every element builds successfully. If any element
+  fails, no partial results are cached and the next `Invoke` retries the
+  whole group. Concurrent resolutions of the same group share a single
+  build.
 
 ## [1.19.0] - 2025-05-13
 

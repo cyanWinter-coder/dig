@@ -601,6 +601,10 @@ func (pt paramGroupedSlice) callGroupDecorators(c containerStore) error {
 // search the given container and its parent for matching group providers and
 // call them to commit values. If an error is encountered, return the number
 // of providers called and a non-nil error from the first provided.
+//
+// The provider list and its order are frozen for the duration of the call:
+// the scope chain is walked exactly once and each scope's providers are
+// snapshotted in registration order before any constructor runs.
 func (pt paramGroupedSlice) callGroupProviders(c containerStore) (int, error) {
 	itemCount := 0
 	for _, c := range c.storesToRoot() {
@@ -619,6 +623,84 @@ func (pt paramGroupedSlice) callGroupProviders(c containerStore) (int, error) {
 	return itemCount, nil
 }
 
+// buildGroup builds this value group transactionally.
+//
+// The set of providers for the group and their order are frozen for the
+// duration of the build, and the group is delivered only if every element
+// builds successfully. If any element fails, none of the values produced
+// by this build are committed and no constructor is marked as called, so
+// the failed build is invisible and the next resolution retries the whole
+// group.
+//
+// Concurrent resolutions of the same group share a single build: the first
+// one runs the providers and the rest observe its outcome.
+//
+// The item count returned is a hint for the capacity of the resulting
+// slice.
+func (pt paramGroupedSlice) buildGroup(c containerStore) (int, error) {
+	stores := c.storesToRoot()
+	leaf, leafOK := stores[0].(*Scope)
+	root, rootOK := stores[len(stores)-1].(*Scope)
+	if !leafOK || !rootOK {
+		// Not a Scope-backed store; build directly without a transaction.
+		return pt.callGroupProviders(c)
+	}
+	txKey := groupTxKey{leaf: leaf, group: key{group: pt.Group, t: pt.Type.Elem()}}
+
+	root.groupTxsMu.Lock()
+	if tx, ok := root.groupTxs[txKey]; ok {
+		// Another resolution is already building this group; share
+		// its outcome instead of building it again. A re-entrant build
+		// of the same group on this resolution path cannot happen in a
+		// verified acyclic graph: it would be a dependency cycle.
+		root.groupTxsMu.Unlock()
+		<-tx.done
+		if tx.panicked != nil {
+			panic(tx.panicked)
+		}
+		if tx.err != nil {
+			return 0, tx.err
+		}
+		return 0, nil
+	}
+	if root.activeGroupTx.Load() != nil {
+		// A provider of another group being built on this resolution
+		// path depends on this group. Build it as part of the
+		// in-progress transaction so that both groups commit or roll
+		// back together.
+		root.groupTxsMu.Unlock()
+		return pt.callGroupProviders(c)
+	}
+	tx := newGroupTransaction()
+	root.groupTxs[txKey] = tx
+	root.activeGroupTx.Store(tx)
+	root.groupTxsMu.Unlock()
+
+	// Guarantee that waiters are released and the transaction is
+	// unregistered even if a constructor panics.
+	defer func() {
+		if p := recover(); p != nil {
+			tx.panicked = p
+		}
+		root.groupTxsMu.Lock()
+		delete(root.groupTxs, txKey)
+		root.activeGroupTx.Store(nil)
+		root.groupTxsMu.Unlock()
+		close(tx.done)
+		if tx.panicked != nil {
+			panic(tx.panicked)
+		}
+	}()
+
+	itemCount, err := pt.callGroupProviders(c)
+	if err != nil {
+		tx.err = err
+		return 0, err
+	}
+	tx.commit()
+	return itemCount, nil
+}
+
 func (pt paramGroupedSlice) Build(c containerStore) (reflect.Value, error) {
 	// do not call this if we are already inside a decorator since
 	// it will result in an infinite recursion. (i.e. decorate -> params.BuildList() -> Decorate -> params.BuildList...)
@@ -633,11 +715,12 @@ func (pt paramGroupedSlice) Build(c containerStore) (reflect.Value, error) {
 	}
 
 	// If we do not have any decorated values and the group isn't soft,
-	// find the providers and call them.
+	// build the group transactionally: the slice is delivered only if
+	// every element of the frozen provider set builds successfully.
 	itemCount := 0
 	if !pt.Soft {
 		var err error
-		itemCount, err = pt.callGroupProviders(c)
+		itemCount, err = pt.buildGroup(c)
 		if err != nil {
 			return _noValue, err
 		}

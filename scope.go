@@ -26,6 +26,8 @@ import (
 	"math/rand"
 	"reflect"
 	"sort"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"go.uber.org/dig/internal/digclock"
@@ -95,6 +97,22 @@ type Scope struct {
 
 	// clockSrc stores the source of time. Defaults to system clock.
 	clockSrc digclock.Clock
+
+	// groupTxsMu guards groupTxs.
+	groupTxsMu sync.Mutex
+
+	// groupTxs holds in-flight transactional value group builds, keyed by
+	// the group being built and the leaf scope that triggered the build.
+	// Only the root scope's map is used.
+	groupTxs map[groupTxKey]*groupTransaction
+
+	// activeGroupTx is the value group transaction currently in progress
+	// for the container rooted at this scope, if any.
+	// Only the root scope's field is used.
+	activeGroupTx atomic.Pointer[groupTransaction]
+
+	// randMu guards rand, which is not safe for concurrent use.
+	randMu sync.Mutex
 }
 
 func newScope() *Scope {
@@ -108,6 +126,7 @@ func newScope() *Scope {
 		invokerFn:       defaultInvoker,
 		rand:            rand.New(rand.NewSource(time.Now().UnixNano())),
 		clockSrc:        digclock.System,
+		groupTxs:        make(map[groupTxKey]*groupTransaction),
 	}
 	s.gh = newGraphHolder(s)
 	return s
@@ -185,7 +204,13 @@ func (s *Scope) knownTypes() []reflect.Type {
 }
 
 func (s *Scope) getValue(name string, t reflect.Type) (v reflect.Value, ok bool) {
-	v, ok = s.values[key{name: name, t: t}]
+	k := key{name: name, t: t}
+	if tx := s.activeGroupTransaction(); tx != nil {
+		if v, ok := tx.stagedValue(s, k); ok {
+			return v, true
+		}
+	}
+	v, ok = s.values[k]
 	return
 }
 
@@ -203,8 +228,19 @@ func (s *Scope) setDecoratedValue(name string, t reflect.Type, v reflect.Value) 
 }
 
 func (s *Scope) getValueGroup(name string, t reflect.Type) []reflect.Value {
-	items := s.groups[key{group: name, t: t}]
+	k := key{group: name, t: t}
+	items := s.groups[k]
+	if tx := s.activeGroupTransaction(); tx != nil {
+		if staged := tx.stagedGroupValues(s, k); len(staged) > 0 {
+			merged := make([]reflect.Value, 0, len(items)+len(staged))
+			merged = append(merged, items...)
+			merged = append(merged, staged...)
+			items = merged
+		}
+	}
 	// shuffle the list so users don't rely on the ordering of grouped values
+	s.randMu.Lock()
+	defer s.randMu.Unlock()
 	return shuffledCopy(s.rand, items)
 }
 
@@ -309,6 +345,13 @@ func (s *Scope) rootScope() *Scope {
 		curr = curr.parentScope
 	}
 	return curr
+}
+
+// activeGroupTransaction returns the value group transaction currently in
+// progress for the container this Scope belongs to, or nil if there is
+// none.
+func (s *Scope) activeGroupTransaction() *groupTransaction {
+	return s.rootScope().activeGroupTx.Load()
 }
 
 // String representation of the entire Scope
