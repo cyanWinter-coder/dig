@@ -21,7 +21,6 @@
 package dig
 
 import (
-	"errors"
 	"fmt"
 	"io"
 	"strconv"
@@ -61,26 +60,37 @@ func (o visualizeErrorOption) applyVisualizeOption(opt *visualizeOptions) {
 	opt.VisualizeError = o.err
 }
 
+// maxErrorDepth bounds the traversal of the error tree. Dig errors form a
+// finite tree, so this is only a guard against pathological errors that wrap
+// themselves, ensuring that visualization can never recurse indefinitely.
+const maxErrorDepth = 100
+
 func updateGraph(dg *dot.Graph, err error) error {
 	var errs []errVisualizer
-	// Unwrap error to find the root cause.
-	for {
-		if ev, ok := err.(errVisualizer); ok {
+	// Walk the full error tree, including errors that wrap more than one
+	// error at once, so that no independent diagnostic is skipped.
+	var walk func(error, int)
+	walk = func(cur error, depth int) {
+		if cur == nil || depth > maxErrorDepth {
+			return
+		}
+		if ev, ok := cur.(errVisualizer); ok {
 			errs = append(errs, ev)
 		}
-		e := errors.Unwrap(err)
-		if e == nil {
-			break
+		for _, next := range unwrapAll(cur) {
+			walk(next, depth+1)
 		}
-		err = e
 	}
+	walk(err, 0)
 
 	// If there are no errVisualizers included, we do not modify the graph.
 	if len(errs) == 0 {
 		return nil
 	}
 
-	// We iterate in reverse because the last element is the root cause.
+	// Apply in reverse discovery order so that the deepest diagnostic in a
+	// linear chain (the root cause) updates the graph last, and the most
+	// specific failure wins.
 	for i := len(errs) - 1; i >= 0; i-- {
 		errs[i].updateGraph(dg)
 	}
@@ -164,17 +174,21 @@ func visualizeCtor(w io.Writer, index int, c *dot.Ctor) {
 
 // CanVisualizeError returns true if the error is an errVisualizer.
 func CanVisualizeError(err error) bool {
-	for {
-		if _, ok := err.(errVisualizer); ok {
+	return canVisualizeError(err, 0)
+}
+
+func canVisualizeError(err error, depth int) bool {
+	if err == nil || depth > maxErrorDepth {
+		return false
+	}
+	if _, ok := err.(errVisualizer); ok {
+		return true
+	}
+	for _, next := range unwrapAll(err) {
+		if canVisualizeError(next, depth+1) {
 			return true
 		}
-		e := errors.Unwrap(err)
-		if e == nil {
-			break
-		}
-		err = e
 	}
-
 	return false
 }
 

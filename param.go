@@ -346,7 +346,7 @@ func getParamOrder(gh *graphHolder, param param) []int {
 	case paramGroupedSlice:
 		// value group parameters have nodes of their own.
 		// We can directly return that here.
-		orders = append(orders, p.orders[gh.s])
+		orders = append(orders, p.Order(gh.s))
 	case paramObject:
 		for _, pf := range p.Fields {
 			orders = append(orders, getParamOrder(gh, pf.Param)...)
@@ -504,6 +504,21 @@ type paramGroupedSlice struct {
 	Soft bool
 
 	orders map[*Scope]int
+}
+
+// Order reports the order of this value group node in the given Scope's
+// graphHolder. Value group nodes are shared between a Scope and its
+// descendants, so the reported order must be the one recorded at creation
+// time rather than a fresh, per-Scope value.
+func (pt paramGroupedSlice) Order(s *Scope) int {
+	return pt.orders[s]
+}
+
+// CopyOrder copies the order for the given parent scope to the given child
+// scope, so that an inherited value group node keeps its identity in the
+// child's graph.
+func (pt paramGroupedSlice) CopyOrder(parent, child *Scope) {
+	pt.orders[child] = pt.orders[parent]
 }
 
 func (pt paramGroupedSlice) String() string {

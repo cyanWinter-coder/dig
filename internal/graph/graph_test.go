@@ -155,3 +155,119 @@ func TestGraphIsCyclic(t *testing.T) {
 		assert.Equal(t, tt.cycle, c)
 	}
 }
+
+func TestFindCycles(t *testing.T) {
+	testCases := []struct {
+		desc  string
+		edges [][]int
+
+		// Each cycle is expected to start and end with its smallest node.
+		want [][]int
+	}{
+		{
+			desc:  "empty graph",
+			edges: nil,
+		},
+		{
+			desc: "acyclic graph",
+			edges: [][]int{
+				{1, 2},
+				{2},
+				nil,
+			},
+		},
+		{
+			desc: "self loop",
+			edges: [][]int{
+				{0},
+			},
+			want: [][]int{{0, 0}},
+		},
+		{
+			desc: "single cycle",
+			edges: [][]int{
+				{1},
+				{2},
+				{3},
+				{0},
+			},
+			want: [][]int{{0, 1, 2, 3, 0}},
+		},
+		{
+			desc: "multiple independent cycles",
+			edges: [][]int{
+				{1},
+				{0},
+				{3},
+				{2},
+			},
+			want: [][]int{
+				{0, 1, 0},
+				{2, 3, 2},
+			},
+		},
+		{
+			desc: "cycle after unreachable acyclic nodes",
+			edges: [][]int{
+				{1},
+				nil,
+				{3},
+				{2},
+			},
+			want: [][]int{{2, 3, 2}},
+		},
+		{
+			desc: "overlapping cycles report one representative",
+			edges: [][]int{
+				{1, 2},
+				{2},
+				{1},
+			},
+			want: [][]int{{1, 2, 1}},
+		},
+		{
+			desc: "cycle starts at smallest node regardless of edge order",
+			edges: [][]int{
+				nil,
+				{2},
+				{1},
+			},
+			want: [][]int{{1, 2, 1}},
+		},
+		{
+			desc: "duplicate edges are not reported as cycles",
+			edges: [][]int{
+				{1, 1},
+				{0, 0},
+			},
+			want: [][]int{{0, 1, 0}},
+		},
+		{
+			desc: "out of range edges are ignored",
+			edges: [][]int{
+				{5},
+			},
+		},
+		{
+			desc: "long cycle terminates",
+			edges: [][]int{
+				{1},
+				{2},
+				{3},
+				{4},
+				{0},
+			},
+			want: [][]int{{0, 1, 2, 3, 4, 0}},
+		},
+	}
+
+	for _, tt := range testCases {
+		t.Run(tt.desc, func(t *testing.T) {
+			g := newTestGraph()
+			for i, neighbors := range tt.edges {
+				g.Nodes[i] = neighbors
+			}
+			assert.Equal(t, tt.want, FindCycles(g))
+		})
+	}
+}

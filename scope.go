@@ -130,8 +130,15 @@ func (s *Scope) Scope(name string, opts ...ScopeOption) *Scope {
 	// child copies the parent's graph nodes.
 	for _, node := range s.gh.nodes {
 		child.gh.nodes = append(child.gh.nodes, node)
-		if ctrNode, ok := node.Wrapped.(*constructorNode); ok {
-			ctrNode.CopyOrder(s, child)
+		// Nodes must retain their order in the child scope. Otherwise,
+		// nodes copied from the parent would report a different order in
+		// the child, and cycle detection would report edges that do not
+		// exist. This applies to value group nodes as well as
+		// constructors: both participate in cycle detection.
+		if orderer, ok := node.Wrapped.(interface {
+			CopyOrder(parent, child *Scope)
+		}); ok {
+			orderer.CopyOrder(s, child)
 		}
 	}
 
@@ -287,19 +294,90 @@ func (s *Scope) newGraphNode(wrapped interface{}, orders map[*Scope]int) {
 	}
 }
 
-func (s *Scope) cycleDetectedError(cycle []int) error {
-	var path []cycleErrPathEntry
-	for _, n := range cycle {
-		if n, ok := s.gh.Lookup(n).(*constructorNode); ok {
-			path = append(path, cycleErrPathEntry{
-				Key: key{
-					t: n.CType(),
-				},
-				Func: n.Location(),
-			})
+func (s *Scope) cycleDetectedError(cycles [][]int) error {
+	var paths [][]cycleErrPathEntry
+	for _, cycle := range cycles {
+		if path := s.cyclePath(cycle); len(path) > 0 {
+			paths = append(paths, path)
 		}
 	}
-	return errCycleDetected{Path: path, scope: s}
+	return errCycleDetected{Paths: paths, scope: s}
+}
+
+// cyclePath converts a cycle expressed as graph orders into the ordered list
+// of constructors that participate in it. The first constructor is repeated
+// at the end so that the path visibly closes.
+//
+// The cycle is rotated to start at its lowest constructor node so that the
+// reported path is deterministic even when the cycle was discovered through
+// a value group node. Value group nodes are omitted from the path because
+// they do not correspond to user-provided functions.
+func (s *Scope) cyclePath(cycle []int) []cycleErrPathEntry {
+	if len(cycle) < 2 {
+		return nil
+	}
+
+	// The last element repeats the first one.
+	nodes := cycle[:len(cycle)-1]
+
+	start := -1
+	for i, n := range nodes {
+		if _, ok := s.gh.Lookup(n).(*constructorNode); !ok {
+			continue
+		}
+		if start < 0 || n < nodes[start] {
+			start = i
+		}
+	}
+	if start < 0 {
+		return nil
+	}
+
+	rotated := make([]int, 0, len(nodes)+1)
+	rotated = append(rotated, nodes[start:]...)
+	rotated = append(rotated, nodes[:start]...)
+	rotated = append(rotated, rotated[0])
+
+	var path []cycleErrPathEntry
+	for _, n := range rotated {
+		node, ok := s.gh.Lookup(n).(*constructorNode)
+		if !ok {
+			continue
+		}
+		path = append(path, cycleErrPathEntry{
+			Key:  key{t: node.CType()},
+			Func: node.Location(),
+		})
+	}
+	return path
+}
+
+// cycleSignature renders a stable identity for a cycle within the given
+// Scope so that the same cycle observed through different Scopes is
+// reported only once.
+//
+// Graph orders are per-Scope and can diverge when a Scope adds its own
+// nodes, so the signature is based on node identity: the constructor node
+// for constructor nodes and the group key for value group nodes.
+func (s *Scope) cycleSignature(cycle []int) string {
+	if len(cycle) == 0 {
+		return ""
+	}
+	var b bytes.Buffer
+	for i, n := range cycle {
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		switch w := s.gh.Lookup(n).(type) {
+		case *constructorNode:
+			fmt.Fprintf(&b, "ctor:%v/%v", w.id, w.location)
+		case *paramGroupedSlice:
+			fmt.Fprintf(&b, "group:%v/%q", w.Type.Elem(), w.Group)
+		default:
+			fmt.Fprintf(&b, "node:%T", w)
+		}
+	}
+	return b.String()
 }
 
 // Returns the root Scope that can be reached from this Scope.

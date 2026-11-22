@@ -35,7 +35,13 @@ type cycleErrPathEntry struct {
 }
 
 type errCycleDetected struct {
-	Path  []cycleErrPathEntry
+	// Paths contains one path per detected cycle. Each path lists the
+	// constructors of the cycle and repeats the first constructor at the
+	// end, so that both the entry and the exit of the cycle are visible.
+	//
+	// Paths is deterministic: cycles are ordered by the graph order of
+	// their constructors, and each path starts at its lowest constructor.
+	Paths [][]cycleErrPathEntry
 	scope *Scope
 }
 
@@ -50,16 +56,24 @@ func (e errCycleDetected) Error() string {
 	//   	depends on func(*foo) baz provided by "somepackage".NewBar (anotherfile.go:2)
 	//   	depends on func(*bar) *foo provided by "path/to/package".NewFoo (path/to/file.go:42)
 	//
+	// If multiple independent cycles were found, each is listed in turn.
+	// The rendering is bounded by the number of paths: it never follows
+	// the graph, so it cannot recurse indefinitely.
 	b := new(bytes.Buffer)
 
 	if name := e.scope.name; len(name) > 0 {
 		fmt.Fprintf(b, "[scope %q]\n", name)
 	}
-	for i, entry := range e.Path {
+	for i, path := range e.Paths {
 		if i > 0 {
-			b.WriteString("\n\tdepends on ")
+			b.WriteString("\n")
 		}
-		fmt.Fprintf(b, "%v provided by %v", entry.Key, entry.Func)
+		for j, entry := range path {
+			if j > 0 {
+				b.WriteString("\n\tdepends on ")
+			}
+			fmt.Fprintf(b, "%v provided by %v", entry.Key, entry.Func)
+		}
 	}
 	return b.String()
 }

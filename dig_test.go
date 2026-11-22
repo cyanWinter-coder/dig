@@ -28,6 +28,7 @@ import (
 	"math/rand"
 	"os"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -2596,6 +2597,257 @@ func testProvideCycleFails(t *testing.T, dryRun bool) {
 			`depends on func\(\*dig_test.C\) \*dig_test.C provided by "go.uber.org/dig_test".testProvideCycleFails.\S+ \(\S+\)`,
 		)
 	})
+}
+
+// TestProvideReportsAllConflicts verifies that a single Provide reports every
+// conflicting result it would introduce, in a deterministic order, instead of
+// stopping at the first one.
+func TestProvideReportsAllConflicts(t *testing.T) {
+	t.Parallel()
+
+	type A struct{}
+	type B struct{}
+	type ret struct {
+		dig.Out
+
+		A1 A
+		B1 B
+		A2 A
+		B2 B
+	}
+
+	c := digtest.New(t)
+	c.RequireProvide(func() A { return A{} })
+	c.RequireProvide(func() B { return B{} })
+
+	err := c.Provide(func() ret { return ret{} })
+	require.Error(t, err)
+	assert.True(t, errors.As(err, new(dig.Error)), "expected a dig error")
+
+	dig.AssertErrorMatches(t, err,
+		`cannot provide function "go.uber.org/dig_test".TestProvideReportsAllConflicts\S+`,
+		`cannot provide dig_test.A from \[0\].A1:`,
+		`cannot provide dig_test.A from \[0\].A2:`,
+		`cannot provide dig_test.B from \[0\].B1:`,
+		`cannot provide dig_test.B from \[0\].B2:`,
+	)
+
+	// A rejected constructor must not be partially committed: the values it
+	// would have provided are still only available from their original
+	// providers.
+	var gotA A
+	c.RequireInvoke(func(a A) { gotA = a })
+	assert.Equal(t, A{}, gotA, "rejected constructor must not replace the existing provider")
+}
+
+// TestProvideCycleReportsAllCycles verifies that a candidate graph that
+// introduces several independent cycles reports all of them, and that each
+// reported path starts and ends at the same constructor.
+func TestProvideCycleReportsAllCycles(t *testing.T) {
+	t.Parallel()
+
+	type A struct{}
+	type B struct{}
+	type C struct{}
+	type D struct{}
+
+	t.Run("deferred verification reports every cycle", func(t *testing.T) {
+		t.Parallel()
+
+		c := digtest.New(t, dig.DeferAcyclicVerification())
+		c.RequireProvide(func(*B) *A { return &A{} })
+		c.RequireProvide(func(*A) *B { return &B{} })
+		c.RequireProvide(func(*D) *C { return &C{} })
+		c.RequireProvide(func(*C) *D { return &D{} })
+
+		err := c.Invoke(func(*A) {})
+		require.Error(t, err)
+		assert.True(t, dig.IsCycleDetected(err))
+
+		dig.AssertErrorMatches(t, err,
+			`cycle detected in dependency graph:`,
+			// First cycle, closed by the same constructor both times.
+			`func\(\*dig_test.B\) \*dig_test.A provided by`,
+			`depends on func\(\*dig_test.A\) \*dig_test.B provided by`,
+			`depends on func\(\*dig_test.B\) \*dig_test.A provided by`,
+			// Second cycle.
+			`func\(\*dig_test.D\) \*dig_test.C provided by`,
+			`depends on func\(\*dig_test.C\) \*dig_test.D provided by`,
+			`depends on func\(\*dig_test.D\) \*dig_test.C provided by`,
+		)
+	})
+
+	t.Run("cycle through a value group keeps both endpoints", func(t *testing.T) {
+		t.Parallel()
+
+		type elem struct{}
+
+		type out struct {
+			dig.Out
+
+			Items []elem `group:"items"`
+		}
+		type in struct {
+			dig.In
+
+			Items [][]elem `group:"items"`
+		}
+
+		c := digtest.New(t)
+		c.RequireProvide(func() out { return out{} })
+
+		err := c.Provide(func(in) out { return out{} })
+		require.Error(t, err)
+		require.True(t, dig.IsCycleDetected(err))
+
+		// The path must contain the constructor twice: once to enter the
+		// cycle and once to close it.
+		dig.AssertErrorMatches(t, err,
+			`this function introduces a cycle:`,
+			`func\(dig_test.in\) dig_test.out provided by "go.uber.org/dig_test".TestProvideCycleReportsAllCycles\S+ \(\S+\)`,
+			`depends on func\(dig_test.in\) dig_test.out provided by`,
+		)
+	})
+}
+
+// TestProvideRejectedCandidateNotCommitted verifies that a Provide rejected
+// for any reason leaves no trace: the candidate graph is not visible to later
+// Provides, Invokes, or Visualize, including from child scopes.
+func TestProvideRejectedCandidateNotCommitted(t *testing.T) {
+	t.Parallel()
+
+	type A struct{}
+	type B struct{}
+	type C struct{}
+	type D struct{}
+
+	t.Run("cycle is rolled back from all scopes", func(t *testing.T) {
+		t.Parallel()
+
+		root := digtest.New(t)
+		child := root.Scope("child")
+
+		root.RequireProvide(func(*C) *A { return &A{} })
+		child.RequireProvide(func(*A) *B { return &B{} })
+
+		err := root.Provide(func(*B) *C { return &C{} })
+		require.Error(t, err)
+		assert.True(t, dig.IsCycleDetected(err))
+
+		// The rejected constructor must not be available anywhere.
+		assert.Error(t, root.Invoke(func(*C) {}), "rejected constructor must not be available in the parent")
+		assert.Error(t, child.Invoke(func(*C) {}), "rejected constructor must not be available in the child")
+
+		// The graph must still be usable: a rejected Provide must not
+		// wedge the container.
+		root.RequireProvide(func() *D { return &D{} })
+		root.RequireInvoke(func(*D) {})
+	})
+
+	t.Run("rejected constructor is not visualized", func(t *testing.T) {
+		t.Parallel()
+
+		c := digtest.New(t)
+		c.RequireProvide(func(*C) *A { return &A{} })
+		c.RequireProvide(func(*A) *B { return &B{} })
+
+		rejected := func(*B) *C { return &C{} }
+		err := c.Provide(rejected)
+		require.Error(t, err)
+
+		var b strings.Builder
+		require.NoError(t, dig.Visualize(c.Container, &b))
+		assert.NotContains(t, b.String(), "rejected",
+			"rejected constructor must not appear in the visualization")
+		assert.Equal(t, 2, strings.Count(b.String(), "subgraph cluster_"),
+			"only committed constructors should be visualized")
+	})
+
+	t.Run("rejected duplicate is not available", func(t *testing.T) {
+		t.Parallel()
+
+		type out struct {
+			dig.Out
+
+			A1 A
+			A2 A
+		}
+
+		c := digtest.New(t)
+		err := c.Provide(func() out { return out{} })
+		require.Error(t, err)
+
+		assert.Error(t, c.Invoke(func(A) {}), "rejected constructor must not be available")
+
+		var b strings.Builder
+		require.NoError(t, dig.Visualize(c.Container, &b))
+		assert.Equal(t, 0, strings.Count(b.String(), "subgraph cluster_"),
+			"rejected constructor must not be visualized")
+	})
+}
+
+// TestProvideReportsIndependentProblems verifies that a duplicate-provider
+// problem and a cycle in the same candidate graph are both reported, rather
+// than one hiding the other. The combined report must be deterministic.
+func TestProvideReportsIndependentProblems(t *testing.T) {
+	t.Parallel()
+
+	type A struct{}
+	type B struct{}
+	type C struct{}
+	type D struct{}
+
+	provide := func(c *digtest.Container) error {
+		c.RequireProvide(func() D { return D{} })
+		c.RequireProvide(func() C { return C{} })
+		c.RequireProvide(func(D) B { return B{} })
+		// The candidate constructor repeats A twice (a conflict) and also
+		// closes a B -> A -> B cycle.
+		return c.Provide(func(B) (A, D, C, A) { return A{}, D{}, C{}, A{} })
+	}
+
+	c := digtest.New(t)
+	err := provide(c)
+	require.Error(t, err)
+	require.True(t, dig.IsCycleDetected(err), "cycle diagnostic must not be hidden by the conflicts")
+
+	dig.AssertErrorMatches(t, err,
+		`cannot provide dig_test.A from \[3\]:`,
+		`already provided by \[0\]`,
+		`cannot provide dig_test.C from \[2\]:`,
+		`cannot provide dig_test.D from \[1\]:`,
+		`this function introduces a cycle:`,
+	)
+
+	// The same inputs must produce byte-for-byte identical diagnostics.
+	for i := 0; i < 10; i++ {
+		other := provide(digtest.New(t))
+		require.Error(t, other)
+		require.Equal(t, err.Error(), other.Error(), "diagnostics must be deterministic")
+	}
+}
+
+// TestInvokeReportsIndependentProblems verifies that a missing dependency
+// does not hide a cycle in the graph, and vice versa.
+func TestInvokeReportsIndependentProblems(t *testing.T) {
+	t.Parallel()
+
+	type A struct{}
+	type B struct{}
+	type Missing struct{}
+
+	c := digtest.New(t, dig.DeferAcyclicVerification())
+	c.RequireProvide(func(*B) *A { return &A{} })
+	c.RequireProvide(func(*A) *B { return &B{} })
+
+	err := c.Invoke(func(*A, *Missing) {})
+	require.Error(t, err)
+	require.True(t, dig.IsCycleDetected(err), "cycle must be reported")
+
+	dig.AssertErrorMatches(t, err,
+		`missing type:`,
+		`cycle detected in dependency graph:`,
+	)
 }
 
 func TestProvideErrNonCycle(t *testing.T) {

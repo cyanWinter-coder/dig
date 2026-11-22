@@ -24,6 +24,7 @@ import (
 	"bytes"
 	"fmt"
 	"reflect"
+	"sort"
 	"strings"
 
 	"go.uber.org/dig/internal/digreflect"
@@ -449,19 +450,25 @@ func (s *Scope) provide(ctor interface{}, opts provideOptions) (err error) {
 	// take a snapshot of the current graph state before
 	// we start making changes to it as we may need to
 	// undo them upon encountering errors.
+	//
+	// The candidate graph is only committed if every diagnostic passes.
+	// Until then, every change made below is reversible as a unit, so that
+	// a rejected Provide is never partially visible to later Provides,
+	// Invokes, or Visualize.
 	allScopes := s.appendSubscopes(nil)
-
-	defer func(allSc []*Scope) {
-		if err != nil {
-			for _, sc := range allSc {
-				sc.gh.Rollback()
-			}
-		}
-	}(allScopes)
-
 	for _, sc := range allScopes {
 		sc.gh.Snapshot()
 	}
+
+	committed := false
+	defer func() {
+		if committed {
+			return
+		}
+		for _, sc := range allScopes {
+			sc.gh.Rollback()
+		}
+	}()
 
 	n, err := newConstructorNode(
 		ctor,
@@ -480,10 +487,7 @@ func (s *Scope) provide(ctor interface{}, opts provideOptions) (err error) {
 		return err
 	}
 
-	keys, err := s.findAndValidateResults(n.ResultList())
-	if err != nil {
-		return err
-	}
+	keys, conflicts := s.findAndValidateResults(n.ResultList())
 
 	ctype := reflect.TypeOf(ctor)
 	if len(keys) == 0 {
@@ -491,32 +495,82 @@ func (s *Scope) provide(ctor interface{}, opts provideOptions) (err error) {
 			fmt.Sprintf("%v must provide at least one non-error type", ctype), nil)
 	}
 
-	oldProviders := make(map[key][]*constructorNode)
+	// Install the candidate constructor as a provider for every value it
+	// produces, including values that conflict. Keeping the candidate graph
+	// complete lets the cycle check see every edge the constructor would
+	// introduce, so a conflict never hides an independent cycle.
+	oldProviders := make(map[key][]*constructorNode, len(keys))
 	for k := range keys {
-		// Cache old providers before running cycle detection.
+		// Cache old providers so that a rejected candidate graph can be
+		// rolled back to exactly the state it had before this node was
+		// introduced.
 		oldProviders[k] = s.providers[k]
 		s.providers[k] = append(s.providers[k], n)
 	}
 
-	for _, s := range allScopes {
-		s.isVerifiedAcyclic = false
-		if s.deferAcyclicVerification {
+	// Providers must be restored if the candidate graph is rejected, even
+	// when the rejection is not caused by a cycle.
+	defer func() {
+		if committed {
+			return
+		}
+		for k, old := range oldProviders {
+			s.providers[k] = old
+		}
+	}()
+
+	// Collect every independent cycle introduced by the candidate graph
+	// before deciding whether to commit, so that a single rejection
+	// reports every problem it can find.
+	//
+	// Scopes share graph nodes, so the same cycle can be visible from a
+	// parent and its descendants. Each distinct cycle is reported once, at
+	// the scope where it applies; the scopes are traversed parent-first, so
+	// the reported scope is the outermost one that observes the cycle.
+	var cycleErrs []error
+	reportedCycles := make(map[string]struct{})
+	for _, sc := range allScopes {
+		sc.isVerifiedAcyclic = false
+		if sc.deferAcyclicVerification {
 			continue
 		}
-		if ok, cycle := graph.IsAcyclic(s.gh); !ok {
-			// When a cycle is detected, recover the old providers to reset
-			// the providers map back to what it was before this node was
-			// introduced.
-			for k, ops := range oldProviders {
-				s.providers[k] = ops
-			}
-
-			return newErrInvalidInput("this function introduces a cycle", s.cycleDetectedError(cycle))
+		cycles := graph.FindCycles(sc.gh)
+		if len(cycles) == 0 {
+			sc.isVerifiedAcyclic = true
+			continue
 		}
-		s.isVerifiedAcyclic = true
+
+		unique := make([][]int, 0, len(cycles))
+		for _, cycle := range cycles {
+			sig := sc.cycleSignature(cycle)
+			if sig != "" {
+				if _, ok := reportedCycles[sig]; ok {
+					continue
+				}
+				reportedCycles[sig] = struct{}{}
+			}
+			unique = append(unique, cycle)
+		}
+		if len(unique) > 0 {
+			cycleErrs = append(cycleErrs,
+				newErrInvalidInput("this function introduces a cycle", sc.cycleDetectedError(unique)))
+		}
+	}
+
+	// Conflicts (duplicate results or results already provided) and cycles
+	// are independent problems: report all of them, in a deterministic
+	// order, rather than stopping at the first.
+	var independent []error
+	if conflicts != nil {
+		independent = append(independent, conflicts)
+	}
+	independent = append(independent, cycleErrs...)
+	if err := newErrDiagnostics(independent...); err != nil {
+		return err
 	}
 
 	s.nodes = append(s.nodes, n)
+	committed = true
 
 	// Record introspection info for caller if Info option is specified
 	if info := opts.Info; info != nil {
@@ -547,24 +601,42 @@ func (s *Scope) provide(ctor interface{}, opts provideOptions) (err error) {
 	return nil
 }
 
-// Builds a collection of all result types produced by this constructor.
-func (s *Scope) findAndValidateResults(rl resultList) (map[key]struct{}, error) {
-	var err error
+// findAndValidateResults builds the collection of all result types produced
+// by this constructor and reports every conflict found along the way.
+//
+// Conflicts are collected rather than short-circuited, and the returned
+// slice is sorted, so that a single error describes every conflicting value
+// in a deterministic order. The returned key set contains every value the
+// constructor produces, including conflicting ones: the candidate graph must
+// remain complete so that independent problems, such as a cycle that passes
+// through this constructor, can still be diagnosed before the graph is
+// rejected.
+func (s *Scope) findAndValidateResults(rl resultList) (map[key]struct{}, errProvideConflicts) {
 	keyPaths := make(map[key]string)
+	produced := make(map[key]struct{})
+	conflicts := make(map[string]provideConflict)
+
 	walkResult(rl, connectionVisitor{
-		s:        s,
-		err:      &err,
-		keyPaths: keyPaths,
+		s:         s,
+		keyPaths:  keyPaths,
+		produced:  produced,
+		conflicts: conflicts,
 	})
 
-	if err != nil {
-		return nil, err
-	}
-
-	keys := make(map[key]struct{}, len(keyPaths))
-	for k := range keyPaths {
+	keys := make(map[key]struct{}, len(produced))
+	for k := range produced {
 		keys[k] = struct{}{}
 	}
+
+	if len(conflicts) > 0 {
+		sorted := make(errProvideConflicts, 0, len(conflicts))
+		for _, c := range conflicts {
+			sorted = append(sorted, c)
+		}
+		sort.Sort(sorted)
+		return keys, sorted
+	}
+
 	return keys, nil
 }
 
@@ -572,10 +644,6 @@ func (s *Scope) findAndValidateResults(rl resultList) (map[key]struct{}, error) 
 // produced by that node.
 type connectionVisitor struct {
 	s *Scope
-
-	// If this points to a non-nil value, we've already encountered an error
-	// and should stop traversing.
-	err *error
 
 	// Map of keys provided to path that provided this. The path is a string
 	// documenting which positional return value or dig.Out attribute is
@@ -585,6 +653,17 @@ type connectionVisitor struct {
 	// attribute of the dig.Out returned as the first result of the
 	// constructor.
 	keyPaths map[key]string
+
+	// produced accumulates every key this constructor produces, including
+	// keys that conflict, so that the candidate graph is complete for
+	// downstream checks.
+	produced map[key]struct{}
+
+	// conflicts accumulates every conflicting key found while visiting
+	// results, keyed by the conflicting value and result path so that every
+	// conflicting result is reported while repeats of the same result are
+	// not. All copies of this visitor share the same map.
+	conflicts map[string]provideConflict
 
 	// We track the path to the current result here. For example, this will
 	// be, ["[1]", "Foo", "Bar"] when we're visiting Bar in,
@@ -612,28 +691,14 @@ func (cv connectionVisitor) AnnotateWithPosition(i int) resultVisitor {
 }
 
 func (cv connectionVisitor) Visit(res result) resultVisitor {
-	// Already failed. Stop looking.
-	if *cv.err != nil {
-		return nil
-	}
-
 	path := strings.Join(cv.currentResultPath, ".")
 
 	switch r := res.(type) {
 
 	case resultSingle:
-		k := key{name: r.Name, t: r.Type}
-
-		if err := cv.checkKey(k, path); err != nil {
-			*cv.err = err
-			return nil
-		}
+		cv.checkKey(key{name: r.Name, t: r.Type}, path)
 		for _, asType := range r.As {
-			k := key{name: r.Name, t: asType}
-			if err := cv.checkKey(k, path); err != nil {
-				*cv.err = err
-				return nil
-			}
+			cv.checkKey(key{name: r.Name, t: asType}, path)
 		}
 
 	case resultGrouped:
@@ -642,29 +707,68 @@ func (cv connectionVisitor) Visit(res result) resultVisitor {
 		// value there.
 		k := key{group: r.Group, t: r.Type}
 		cv.keyPaths[k] = path
+		cv.recordProduced(k)
 		for _, asType := range r.As {
 			k := key{group: r.Group, t: asType}
 			cv.keyPaths[k] = path
+			cv.recordProduced(k)
 		}
 	}
 
 	return cv
 }
 
-func (cv connectionVisitor) checkKey(k key, path string) error {
-	defer func() { cv.keyPaths[k] = path }()
+// checkKey records whether the key can be provided by this constructor.
+// A conflict is recorded when the key was already produced earlier by the
+// same constructor or is already provided by the Scope. Regardless of the
+// outcome, the key is recorded as produced so that the candidate graph
+// stays complete for subsequent diagnostics.
+func (cv connectionVisitor) checkKey(k key, path string) {
+	cv.recordProduced(k)
+
 	if conflict, ok := cv.keyPaths[k]; ok {
-		return newErrInvalidInput(fmt.Sprintf("cannot provide %v from %v", k, path),
-			newErrInvalidInput(fmt.Sprintf("already provided by %v", conflict), nil))
+		cv.recordConflict(k, path, conflict)
+		return
 	}
 	if ps := cv.s.providers[k]; len(ps) > 0 {
 		cons := make([]string, len(ps))
 		for i, p := range ps {
 			cons[i] = fmt.Sprint(p.Location())
 		}
+		// Locations are sorted so that the message does not depend on the
+		// order in which providers happened to be registered.
+		sort.Strings(cons)
 
-		return newErrInvalidInput(fmt.Sprintf("cannot provide %v from %v", k, path),
-			newErrInvalidInput(fmt.Sprintf("already provided by %v", strings.Join(cons, "; ")), nil))
+		cv.recordConflict(k, path, strings.Join(cons, "; "))
+		return
 	}
-	return nil
+
+	cv.keyPaths[k] = path
+}
+
+// recordProduced records that this constructor produces the key. It is
+// recorded for conflicting keys as well, so that the candidate graph remains
+// complete for later diagnostics.
+func (cv connectionVisitor) recordProduced(k key) {
+	if cv.produced != nil {
+		cv.produced[k] = struct{}{}
+	}
+}
+
+func (cv connectionVisitor) recordConflict(k key, path, existing string) {
+	if cv.conflicts == nil {
+		return
+	}
+	// A constructor that returns two results of the same type reports one
+	// conflict per result path: "from [0].A2" and "from [0].A3" are
+	// distinct problems, even though they conflict with the same value.
+	dedupeKey := k.String() + "\x00" + path
+	if _, ok := cv.conflicts[dedupeKey]; ok {
+		return
+	}
+	cv.conflicts[dedupeKey] = provideConflict{
+		Key:      k,
+		Path:     path,
+		Existing: existing,
+	}
 }

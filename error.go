@@ -193,6 +193,153 @@ func (e errInvalidInput) Format(w fmt.State, c rune) {
 	formatError(e, w, c)
 }
 
+// errProvideConflicts is returned when a constructor provides values that
+// conflict with each other or with values already provided.
+//
+// Every conflict found in the candidate graph is collected, so that a single
+// error describes all conflicting values instead of stopping at the first
+// one. The conflicts are sorted by key, result path, and existing provider,
+// making the rendered order independent of result-walking or registration
+// order.
+type errProvideConflicts []provideConflict
+
+var _ digError = errProvideConflicts(nil)
+
+func (e errProvideConflicts) Error() string { return fmt.Sprint(e) }
+
+func (e errProvideConflicts) writeMessage(w io.Writer, verb string) {
+	multiline := verb == "%+v"
+	for i, c := range e {
+		if i > 0 {
+			if multiline {
+				io.WriteString(w, "\n")
+			} else {
+				io.WriteString(w, "; ")
+			}
+		}
+		fmt.Fprintf(w, "cannot provide %v from %v", c.Key, c.Path)
+		if multiline {
+			io.WriteString(w, ":\n")
+		} else {
+			io.WriteString(w, ": ")
+		}
+		fmt.Fprintf(w, "already provided by %v", c.Existing)
+	}
+}
+
+func (e errProvideConflicts) Format(w fmt.State, c rune) {
+	formatError(e, w, c)
+}
+
+// Len, Less, and Swap make conflicts sortable so that the reported order is
+// independent of the order in which results and providers were visited.
+func (e errProvideConflicts) Len() int { return len(e) }
+
+func (e errProvideConflicts) Less(i, j int) bool {
+	if e[i].Key.String() != e[j].Key.String() {
+		return e[i].Key.String() < e[j].Key.String()
+	}
+	if e[i].Path != e[j].Path {
+		return e[i].Path < e[j].Path
+	}
+	return e[i].Existing < e[j].Existing
+}
+
+func (e errProvideConflicts) Swap(i, j int) { e[i], e[j] = e[j], e[i] }
+
+// provideConflict describes a single value that a constructor tried to
+// provide more than once, or that was already provided by the Scope.
+type provideConflict struct {
+	// Key is the value that conflicted.
+	Key key
+
+	// Path identifies the result that tried to provide the value.
+	Path string
+
+	// Existing identifies where the value was already provided from.
+	Existing string
+}
+
+// errDiagnostics reports several independent problems discovered while
+// validating the same candidate graph.
+//
+// Each problem is rendered in a deterministic order, and a failure in one
+// diagnostic never hides another. Unwrap exposes each part so that callers
+// using errors.As or errors.Is (and the visualizer) can still find the
+// individual errors.
+type errDiagnostics struct {
+	Parts []error
+}
+
+var _ digError = errDiagnostics{}
+
+func (e errDiagnostics) Error() string { return fmt.Sprint(e) }
+
+func (e errDiagnostics) Unwrap() []error { return e.Parts }
+
+func (e errDiagnostics) writeMessage(w io.Writer, verb string) {
+	multiline := verb == "%+v"
+	for i, part := range e.Parts {
+		if i > 0 {
+			if multiline {
+				io.WriteString(w, "\n")
+			} else {
+				io.WriteString(w, "; ")
+			}
+		}
+		fmt.Fprintf(w, verb, part)
+	}
+}
+
+func (e errDiagnostics) Format(w fmt.State, c rune) {
+	formatError(e, w, c)
+}
+
+// newErrDiagnostics combines the given errors into a single error. Empty
+// parts are skipped, and a single part is returned as-is so that callers
+// preserve the exact message of the single-problem case.
+func newErrDiagnostics(parts ...error) error {
+	var nonEmpty []error
+	for _, part := range parts {
+		if part == nil {
+			continue
+		}
+		// Flatten nested diagnostics so that a combined error never nests
+		// another combined error. A wrapped diagnostic is left in place; it
+		// is expanded when the error tree is walked.
+		if ds, ok := part.(errDiagnostics); ok { //nolint:errorlint // exact type, not a wrapped error
+			nonEmpty = append(nonEmpty, ds.Parts...)
+			continue
+		}
+		nonEmpty = append(nonEmpty, part)
+	}
+
+	switch len(nonEmpty) {
+	case 0:
+		return nil
+	case 1:
+		return nonEmpty[0]
+	default:
+		return errDiagnostics{Parts: nonEmpty}
+	}
+}
+
+// unwrapAll returns the errors directly wrapped by err. Unlike
+// errors.Unwrap, it understands errors that wrap multiple errors at once,
+// such as errDiagnostics.
+func unwrapAll(err error) []error {
+	if err == nil {
+		return nil
+	}
+	if multi, ok := err.(interface{ Unwrap() []error }); ok {
+		return multi.Unwrap()
+	}
+	if next := errors.Unwrap(err); next != nil {
+		return []error{next}
+	}
+	return nil
+}
+
 // errProvide is returned when a constructor could not be Provided into the
 // container.
 type errProvide struct {

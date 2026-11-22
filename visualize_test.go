@@ -640,6 +640,34 @@ func TestVisualize(t *testing.T) {
 
 		dig.VerifyVisualization(t, "missingDep", c.Container, dig.VisualizeError(err))
 	})
+
+	t.Run("rejected candidate graph is not visualized", func(t *testing.T) {
+		// A Provide whose candidate graph introduces a cycle must not leave
+		// any trace in the visualization: only committed nodes are shown.
+		type A struct{}
+		type B struct{}
+		type C struct{}
+
+		c := digtest.New(t)
+		c.RequireProvide(func(*C) *A { return &A{} })
+		c.RequireProvide(func(*A) *B { return &B{} })
+
+		err := c.Provide(func(*B) *C { return &C{} })
+		require.Error(t, err)
+		require.True(t, dig.IsCycleDetected(err))
+
+		var b strings.Builder
+		require.NoError(t, dig.Visualize(c.Container, &b))
+		assert.Equal(t, 2, strings.Count(b.String(), "subgraph cluster_"),
+			"rejected constructor must not be visualized")
+
+		// The visualization of the rejected error must also reflect only
+		// committed nodes.
+		b.Reset()
+		require.NoError(t, dig.Visualize(c.Container, &b, dig.VisualizeError(err)))
+		assert.NotContains(t, b.String(), "func(*dig_test.B) *dig_test.C",
+			"rejected constructor must not be visualized through its error")
+	})
 }
 
 func TestVisualizeErrorString(t *testing.T) {

@@ -5,7 +5,22 @@ The format is based on [Keep a Changelog](http://keepachangelog.com/en/1.0.0/)
 and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.html).
 
 ## Unreleased
-- No changes yet.
+
+### Fixed
+- `Provide` now reports every conflicting value in a rejected candidate
+  graph, in a deterministic order, instead of stopping at the first one.
+- Cycle detection now reports every independent cycle in the graph, and each
+  reported path starts and ends at the same constructor instead of collapsing
+  to a single node.
+- `Provide` reports duplicate-value conflicts and cycles found in the same
+  candidate graph together, and `Invoke` reports a missing dependency
+  alongside a cycle, so one problem no longer hides another.
+- A rejected `Provide` is rolled back completely: the candidate constructor is
+  not visible to later `Provide`, `Invoke`, or `Visualize` calls, including
+  from child scopes, and its graph nodes never appear in the output.
+- Inherited value group nodes keep their graph order in child scopes, which
+  previously caused false-positive cycle errors in scopes that consume a
+  parent's value group.
 
 ## [1.19.0] - 2025-05-13
 

@@ -106,18 +106,27 @@ func (s *Scope) Invoke(function interface{}, opts ...InvokeOption) (err error) {
 		return err
 	}
 
+	// Problems with the graph are independent of missing direct
+	// dependencies: report every one that applies instead of stopping at
+	// the first, in a deterministic order.
+	var missingErr, cycleErr error
 	if err := shallowCheckDependencies(s, pl); err != nil {
-		return errMissingDependencies{
+		missingErr = errMissingDependencies{
 			Func:   digreflect.InspectFunc(function),
 			Reason: err,
 		}
 	}
 
 	if !s.isVerifiedAcyclic {
-		if ok, cycle := graph.IsAcyclic(s.gh); !ok {
-			return newErrInvalidInput("cycle detected in dependency graph", s.cycleDetectedError(cycle))
+		if cycles := graph.FindCycles(s.gh); len(cycles) > 0 {
+			cycleErr = newErrInvalidInput("cycle detected in dependency graph", s.cycleDetectedError(cycles))
+		} else {
+			s.isVerifiedAcyclic = true
 		}
-		s.isVerifiedAcyclic = true
+	}
+
+	if err := newErrDiagnostics(missingErr, cycleErr); err != nil {
+		return err
 	}
 
 	args, err := pl.BuildList(s)
