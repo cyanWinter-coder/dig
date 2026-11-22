@@ -21,9 +21,11 @@
 package dig_test
 
 import (
+	"errors"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"go.uber.org/dig"
 	"go.uber.org/dig/internal/digtest"
 )
@@ -412,5 +414,156 @@ func TestFalsePositiveScopeCycleDetection(t *testing.T) {
 		// Cycle detection would error here because previous two provides
 		// would both have order 0 for child scope.
 		child.RequireProvide(func() float32 { return 0 })
+	})
+}
+
+// These tests verify the ownership rules of scoped value resolution:
+// values constructed while resolving a scope are cached in that scope,
+// are reused only within it, and never leak into its parent or siblings.
+func TestScopeValueCaching(t *testing.T) {
+	t.Parallel()
+
+	t.Run("values constructed in a child are cached in the child, not the parent", func(t *testing.T) {
+		type T struct{ n int }
+
+		c := digtest.New(t)
+
+		var calls int
+		c.RequireProvide(func() *T {
+			calls++
+			return &T{n: calls}
+		})
+
+		child1 := c.Scope("child 1")
+		child2 := c.Scope("child 2")
+
+		// The same scope reuses the instance it constructed.
+		var t1a, t1b *T
+		require.NoError(t, child1.Invoke(func(t *T) { t1a = t }))
+		require.NoError(t, child1.Invoke(func(t *T) { t1b = t }))
+		assert.Same(t, t1a, t1b, "same scope must reuse its cached instance")
+		assert.Equal(t, 1, calls, "constructor must be called at most once per scope")
+
+		// A sibling scope gets its own instance, not child1's.
+		var t2 *T
+		require.NoError(t, child2.Invoke(func(t *T) { t2 = t }))
+		assert.NotSame(t, t1a, t2, "sibling scopes must not share instances")
+		assert.Equal(t, 2, calls)
+
+		// The children's resolutions did not populate the parent's cache:
+		// the parent constructs its own singleton.
+		var rootT *T
+		require.NoError(t, c.Invoke(func(t *T) { rootT = t }))
+		assert.NotSame(t, t1a, rootT, "parent must not reuse a child's instance")
+		assert.NotSame(t, t2, rootT, "parent must not reuse a child's instance")
+		assert.Equal(t, 3, calls)
+
+		// A scope created after the parent resolved inherits the parent's
+		// singleton.
+		child3 := c.Scope("child 3")
+		var t3 *T
+		require.NoError(t, child3.Invoke(func(t *T) { t3 = t }))
+		assert.Same(t, rootT, t3, "child must reuse the instance cached by its parent")
+		assert.Equal(t, 3, calls)
+	})
+
+	t.Run("failed resolution in a child does not pollute the parent cache", func(t *testing.T) {
+		type Dep struct{ n int }
+		type T struct{}
+
+		c := digtest.New(t)
+		c.RequireProvide(func() *Dep { return &Dep{n: 1} })
+		c.RequireProvide(func(*Dep) (*T, error) { return nil, errors.New("great sadness") })
+
+		child := c.Scope("child")
+		require.Error(t, child.Invoke(func(*T) {}),
+			"resolution of a transitive dependency of a failing constructor must fail")
+
+		// Although constructing *T failed, *Dep was successfully built
+		// during the child's resolution. It must have been cached in the
+		// child, not committed to the parent.
+		var childDep, rootDep *Dep
+		require.NoError(t, child.Invoke(func(d *Dep) { childDep = d }))
+		require.NoError(t, c.Invoke(func(d *Dep) { rootDep = d }))
+		assert.NotSame(t, childDep, rootDep,
+			"parent cache must not contain values constructed by the child")
+	})
+
+	t.Run("group values constructed in a child are owned by the child", func(t *testing.T) {
+		type param struct {
+			dig.In
+			Values []string `group:"foo"`
+		}
+
+		c := digtest.New(t)
+
+		var calls int
+		c.RequireProvide(func() string {
+			calls++
+			return "a"
+		}, dig.Group("foo"))
+
+		child := c.Scope("child")
+
+		require.NoError(t, child.Invoke(func(p param) {
+			assert.Equal(t, []string{"a"}, p.Values)
+		}))
+		assert.Equal(t, 1, calls)
+
+		// The parent did not receive the group value constructed for the
+		// child; it constructs its own.
+		require.NoError(t, c.Invoke(func(p param) {
+			assert.Equal(t, []string{"a"}, p.Values)
+		}))
+		assert.Equal(t, 2, calls)
+	})
+
+	t.Run("callbacks observe the resolving scope's view", func(t *testing.T) {
+		type T struct{}
+
+		c := digtest.New(t)
+
+		var beforeCalled, called bool
+		c.RequireProvide(func() *T { return &T{} },
+			dig.WithProviderBeforeCallback(func(dig.BeforeCallbackInfo) { beforeCalled = true }),
+			dig.WithProviderCallback(func(info dig.CallbackInfo) {
+				called = true
+				assert.NoError(t, info.Error)
+			}),
+		)
+
+		child := c.Scope("child")
+		require.NoError(t, child.Invoke(func(*T) {}))
+		assert.True(t, beforeCalled, "before callback must run for the child's resolution")
+		assert.True(t, called, "callback must run for the child's resolution")
+	})
+
+	t.Run("recreated scopes build independent instances", func(t *testing.T) {
+		type T struct{ n int }
+
+		c := digtest.New(t)
+		var calls int
+		c.RequireProvide(func() *T {
+			calls++
+			return &T{n: calls}
+		})
+
+		// Simulate request-scoped usage: each scope is used for one
+		// "request" and discarded afterwards.
+		var instances []*T
+		for i := 0; i < 3; i++ {
+			scope := c.Scope("request")
+			require.NoError(t, scope.Invoke(func(t *T) {
+				instances = append(instances, t)
+			}))
+		}
+		for i := range instances {
+			for j := range instances {
+				if i != j {
+					assert.NotSame(t, instances[i], instances[j],
+						"each scope must construct its own independent instance")
+				}
+			}
+		}
 	})
 }

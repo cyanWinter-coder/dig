@@ -45,8 +45,12 @@ type constructorNode struct {
 	// id uniquely identifies the constructor that produces a node.
 	id dot.CtorID
 
-	// Whether the constructor owned by this node was already called.
-	called bool
+	// Tracks the scopes for which the constructor owned by this node
+	// was already called. A constructor is called at most once per
+	// scope: the values it produces are committed to, and cached in,
+	// the scope that triggered the call, so scopes that resolve the
+	// same constructor independently get independent instances.
+	called map[containerStore]bool
 
 	// Type information about constructor parameters.
 	paramList paramList
@@ -61,7 +65,13 @@ type constructorNode struct {
 	s *Scope
 
 	// Scope this node was originally provided to.
-	// This is different from s if and only if the constructor was Provided with ExportOption.
+	// This is different from s if and only if the constructor was Provided
+	// with ExportOption.
+	//
+	// If the constructor is requested from a scope that origS is not an
+	// ancestor of (only possible with Export), its dependencies are
+	// resolved against origS's view of the graph, since they may refer to
+	// constructors or decorators private to origS's subtree.
 	origS *Scope
 
 	// Callback for this provided function, if there is one.
@@ -114,6 +124,7 @@ func newConstructorNode(ctor interface{}, s *Scope, origS *Scope, opts construct
 		ctype:          ctype,
 		location:       location,
 		id:             dot.CtorID(cptr),
+		called:         make(map[containerStore]bool),
 		paramList:      params,
 		resultList:     results,
 		orders:         make(map[*Scope]int),
@@ -132,7 +143,6 @@ func (n *constructorNode) ResultList() resultList     { return n.resultList }
 func (n *constructorNode) ID() dot.CtorID             { return n.id }
 func (n *constructorNode) CType() reflect.Type        { return n.ctype }
 func (n *constructorNode) Order(s *Scope) int         { return n.orders[s] }
-func (n *constructorNode) OrigScope() *Scope          { return n.origS }
 
 // CopyOrder copies the order for the given parent scope to the given child scope.
 func (n *constructorNode) CopyOrder(parent, child *Scope) {
@@ -143,21 +153,60 @@ func (n *constructorNode) String() string {
 	return fmt.Sprintf("deps: %v, ctor: %v", n.paramList, n.ctype)
 }
 
-// Call calls this constructor if it hasn't already been called and
-// injects any values produced by it into the provided container.
+// Call calls this constructor if it hasn't already been called for the
+// provided containerStore (or one of its ancestors) and injects any values
+// produced by it into that containerStore.
+//
+// Values produced by the constructor are owned by the containerStore that
+// triggered the call: they are cached in, and reused only within, that
+// store and its descendants. A failed call commits nothing, so a scope
+// that fails to resolve a constructor never pollutes its ancestors.
+//
+// The constructor's dependencies are resolved against the view of the
+// graph seen by the triggering store. The only exception is a constructor
+// that was Provided with Export from a scope that is not an ancestor of
+// the triggering store: such a constructor's dependencies may be private
+// to its originating scope's subtree, so they are resolved against the
+// originating scope's view instead. In both cases, the constructor, its
+// parameters (including value groups), and its callbacks observe a single
+// consistent view of the graph within one call.
 func (n *constructorNode) Call(c containerStore) (err error) {
-	if n.called {
+	// view is the store whose graph the constructor resolves against.
+	// It defaults to the triggering store, whose view includes everything
+	// the constructor's originating scope can see.
+	view := c
+
+	// If this constructor was already called by this store or any of
+	// its ancestors, the values it produced are already visible to this
+	// store, so it must not be called again.
+	called := false
+	origVisible := false
+	for _, s := range c.storesToRoot() {
+		if n.called[s] {
+			called = true
+		}
+		if s == n.origS {
+			origVisible = true
+		}
+	}
+	if called {
 		return nil
 	}
+	if !origVisible {
+		// The triggering store cannot see the constructor's originating
+		// scope, so the constructor's dependencies may not be resolvable
+		// from it. Resolve them against the originating scope's view.
+		view = n.origS
+	}
 
-	if err := shallowCheckDependencies(c, n.paramList); err != nil {
+	if err := shallowCheckDependencies(view, n.paramList); err != nil {
 		return errMissingDependencies{
 			Func:   n.location,
 			Reason: err,
 		}
 	}
 
-	args, err := n.paramList.BuildList(c)
+	args, err := n.paramList.BuildList(view)
 	if err != nil {
 		return errArgumentsFailed{
 			Func:   n.location,
@@ -172,13 +221,13 @@ func (n *constructorNode) Call(c containerStore) (err error) {
 	}
 
 	if n.callback != nil {
-		start := c.clock().Now()
+		start := view.clock().Now()
 		// Wrap in separate func to include PanicErrors
 		defer func() {
 			n.callback(CallbackInfo{
 				Name:    fmt.Sprintf("%v.%v", n.location.Package, n.location.Name),
 				Error:   err,
-				Runtime: c.clock().Since(start),
+				Runtime: view.clock().Since(start),
 			})
 		}()
 	}
@@ -195,17 +244,17 @@ func (n *constructorNode) Call(c containerStore) (err error) {
 	}
 
 	receiver := newStagingContainerWriter()
-	results := c.invoker()(reflect.ValueOf(n.ctor), args)
+	results := view.invoker()(reflect.ValueOf(n.ctor), args)
 	if err = n.resultList.ExtractList(receiver, false /* decorating */, results); err != nil {
 		return errConstructorFailed{Func: n.location, Reason: err}
 	}
 
-	// Commit the result to the original container that this constructor
-	// was supplied to. The provided constructor is only used for a view of
-	// the rest of the graph to instantiate the dependencies of this
-	// container.
-	receiver.Commit(n.s)
-	n.called = true
+	// Commit the results to the containerStore that triggered this call.
+	// The values produced by the constructor belong to that store: they
+	// are reused by it and its descendants, but are never visible to its
+	// ancestors or siblings.
+	receiver.Commit(c)
+	n.called[c] = true
 	return nil
 }
 

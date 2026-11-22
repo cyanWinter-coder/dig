@@ -362,8 +362,6 @@ type provider interface {
 	Call(containerStore) error
 
 	CType() reflect.Type
-
-	OrigScope() *Scope
 }
 
 // Provide teaches the container how to build values of one or more types and
@@ -391,10 +389,12 @@ func (c *Container) Provide(constructor interface{}, opts ...ProvideOption) erro
 // parameters and returns one or more results. The function may optionally
 // return an error to indicate that it failed to build the value. This
 // function will be treated as the constructor for all the types it returns.
-// This function will be called AT MOST ONCE when a type produced by it, or a
-// type that consumes this function's output, is requested via Invoke. If the
-// same types are requested multiple times, the previously produced value will
-// be reused.
+// This function will be called AT MOST ONCE per Scope when a type produced
+// by it, or a type that consumes this function's output, is requested via
+// Invoke. If the same types are requested multiple times from the same
+// Scope, the previously produced value will be reused. Values produced
+// while resolving a Scope are cached in that Scope: they are visible to
+// its descendants, but never to its ancestors or sibling Scopes.
 //
 // Provide accepts argument types or dig.In structs as dependencies, and
 // separate return values or dig.Out structs for results.

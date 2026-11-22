@@ -260,11 +260,11 @@ func (ps paramSingle) Build(c containerStore) (reflect.Value, error) {
 	// Starting at the given container and working our way up its parents,
 	// find one that provides this dependency.
 	//
-	// Once found, we'll use that container for the rest of the invocation.
-	// Dependencies of this type will begin searching at that container,
-	// rather than starting at base.
+	// Once found, the constructor is called with the container that
+	// requested the value, so that the constructor, its parameters, and
+	// its callbacks all see the same view of the graph, and the produced
+	// value is cached in that container.
 	var providers []provider
-	var providingContainer containerStore
 	for _, container := range c.storesToRoot() {
 		// first check if the scope already has cached a value for the type.
 		if v, ok := container.getValue(ps.Name, ps.Type); ok {
@@ -272,7 +272,6 @@ func (ps paramSingle) Build(c containerStore) (reflect.Value, error) {
 		}
 		providers = container.getValueProviders(ps.Name, ps.Type)
 		if len(providers) > 0 {
-			providingContainer = container
 			break
 		}
 	}
@@ -285,7 +284,7 @@ func (ps paramSingle) Build(c containerStore) (reflect.Value, error) {
 	}
 
 	for _, n := range providers {
-		err := n.Call(n.OrigScope())
+		err := n.Call(c)
 		if err == nil {
 			continue
 		}
@@ -305,7 +304,7 @@ func (ps paramSingle) Build(c containerStore) (reflect.Value, error) {
 
 	// If we get here, it's impossible for the value to be absent from the
 	// container.
-	v, _ = providingContainer.getValue(ps.Name, ps.Type)
+	v, _ = c.getValue(ps.Name, ps.Type)
 	return v, nil
 }
 
@@ -601,13 +600,18 @@ func (pt paramGroupedSlice) callGroupDecorators(c containerStore) error {
 // search the given container and its parent for matching group providers and
 // call them to commit values. If an error is encountered, return the number
 // of providers called and a non-nil error from the first provided.
+//
+// Providers are called with the container that requested the group (not the
+// container that owns each provider), so that each provider sees the same
+// view of the graph as the rest of this resolution, and the values it
+// produces are committed to the requesting container.
 func (pt paramGroupedSlice) callGroupProviders(c containerStore) (int, error) {
 	itemCount := 0
-	for _, c := range c.storesToRoot() {
-		providers := c.getGroupProviders(pt.Group, pt.Type.Elem())
+	for _, store := range c.storesToRoot() {
+		providers := store.getGroupProviders(pt.Group, pt.Type.Elem())
 		itemCount += len(providers)
 		for _, n := range providers {
-			if err := n.Call(n.OrigScope()); err != nil {
+			if err := n.Call(c); err != nil {
 				return 0, errParamGroupFailed{
 					CtorID: n.ID(),
 					Key:    key{group: pt.Group, t: pt.Type.Elem()},

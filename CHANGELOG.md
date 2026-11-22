@@ -5,7 +5,14 @@ The format is based on [Keep a Changelog](http://keepachangelog.com/en/1.0.0/)
 and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.html).
 
 ## Unreleased
-- No changes yet.
+
+### Fixed
+- Values constructed while resolving a `Scope` are now cached in that `Scope`
+  instead of the `Scope` the constructor was provided to. A constructor is
+  called at most once per `Scope`, and the values it produces are reused only
+  within that `Scope` and its descendants — sibling and parent `Scope`s no
+  longer share instances constructed by a child `Scope`, and a failed
+  resolution in a child `Scope` no longer commits values to its ancestors.
 
 ## [1.19.0] - 2025-05-13
 
