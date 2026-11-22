@@ -24,6 +24,7 @@ import (
 	"bytes"
 	"fmt"
 	"reflect"
+	"sort"
 	"strings"
 
 	"go.uber.org/dig/internal/digreflect"
@@ -498,25 +499,40 @@ func (s *Scope) provide(ctor interface{}, opts provideOptions) (err error) {
 		s.providers[k] = append(s.providers[k], n)
 	}
 
-	for _, s := range allScopes {
-		s.isVerifiedAcyclic = false
-		if s.deferAcyclicVerification {
+	// The candidate graph is only committed if every Scope accepts it.
+	// Until then, the previous providers and graph-verification state must
+	// be restorable as a unit, so that a rejected graph is never partially
+	// visible to later Provides, Invokes, or Visualize.
+	committed := false
+	defer func() {
+		if committed {
+			return
+		}
+		for k, old := range oldProviders {
+			s.providers[k] = old
+		}
+		for _, sc := range allScopes {
+			sc.isVerifiedAcyclic = false
+		}
+	}()
+
+	for _, sc := range allScopes {
+		sc.isVerifiedAcyclic = false
+		if sc.deferAcyclicVerification {
 			continue
 		}
-		if ok, cycle := graph.IsAcyclic(s.gh); !ok {
-			// When a cycle is detected, recover the old providers to reset
-			// the providers map back to what it was before this node was
-			// introduced.
-			for k, ops := range oldProviders {
-				s.providers[k] = ops
-			}
-
-			return newErrInvalidInput("this function introduces a cycle", s.cycleDetectedError(cycle))
+		if cycles := graph.FindCycles(sc.gh); len(cycles) > 0 {
+			return newErrInvalidInput("this function introduces a cycle", sc.cycleDetectedError(cycles))
 		}
-		s.isVerifiedAcyclic = true
+		sc.isVerifiedAcyclic = true
 	}
 
 	s.nodes = append(s.nodes, n)
+	committed = true
+
+	// The graph changed: decorators must be applied again on the next
+	// resolution so that decorated values reflect the new graph.
+	s.bumpGeneration()
 
 	// Record introspection info for caller if Info option is specified
 	if info := opts.Info; info != nil {
@@ -548,17 +564,22 @@ func (s *Scope) provide(ctor interface{}, opts provideOptions) (err error) {
 }
 
 // Builds a collection of all result types produced by this constructor.
+//
+// Every conflict between the candidate results and the values already
+// provided is collected, rather than stopping at the first one, so that a
+// single error describes every conflicting node.
 func (s *Scope) findAndValidateResults(rl resultList) (map[key]struct{}, error) {
-	var err error
 	keyPaths := make(map[key]string)
+	var conflicts errProvideConflicts
 	walkResult(rl, connectionVisitor{
-		s:        s,
-		err:      &err,
-		keyPaths: keyPaths,
+		s:         s,
+		keyPaths:  keyPaths,
+		conflicts: &conflicts,
 	})
 
-	if err != nil {
-		return nil, err
+	if len(conflicts) > 0 {
+		sort.Sort(conflicts)
+		return nil, conflicts
 	}
 
 	keys := make(map[key]struct{}, len(keyPaths))
@@ -568,14 +589,23 @@ func (s *Scope) findAndValidateResults(rl resultList) (map[key]struct{}, error) 
 	return keys, nil
 }
 
+// provideConflict describes a single value that a constructor tried to
+// provide more than once, or that was already provided by the Scope.
+type provideConflict struct {
+	// Key is the value that conflicted.
+	Key key
+
+	// Path identifies the result that tried to provide the value.
+	Path string
+
+	// Existing identifies where the value was already provided from.
+	Existing string
+}
+
 // Visits the results of a node and compiles a collection of all the keys
 // produced by that node.
 type connectionVisitor struct {
 	s *Scope
-
-	// If this points to a non-nil value, we've already encountered an error
-	// and should stop traversing.
-	err *error
 
 	// Map of keys provided to path that provided this. The path is a string
 	// documenting which positional return value or dig.Out attribute is
@@ -585,6 +615,10 @@ type connectionVisitor struct {
 	// attribute of the dig.Out returned as the first result of the
 	// constructor.
 	keyPaths map[key]string
+
+	// conflicts accumulates every conflict found while visiting results.
+	// All copies of this visitor share the same slice.
+	conflicts *errProvideConflicts
 
 	// We track the path to the current result here. For example, this will
 	// be, ["[1]", "Foo", "Bar"] when we're visiting Bar in,
@@ -612,28 +646,14 @@ func (cv connectionVisitor) AnnotateWithPosition(i int) resultVisitor {
 }
 
 func (cv connectionVisitor) Visit(res result) resultVisitor {
-	// Already failed. Stop looking.
-	if *cv.err != nil {
-		return nil
-	}
-
 	path := strings.Join(cv.currentResultPath, ".")
 
 	switch r := res.(type) {
 
 	case resultSingle:
-		k := key{name: r.Name, t: r.Type}
-
-		if err := cv.checkKey(k, path); err != nil {
-			*cv.err = err
-			return nil
-		}
+		cv.checkKey(key{name: r.Name, t: r.Type}, path)
 		for _, asType := range r.As {
-			k := key{name: r.Name, t: asType}
-			if err := cv.checkKey(k, path); err != nil {
-				*cv.err = err
-				return nil
-			}
+			cv.checkKey(key{name: r.Name, t: asType}, path)
 		}
 
 	case resultGrouped:
@@ -651,20 +671,32 @@ func (cv connectionVisitor) Visit(res result) resultVisitor {
 	return cv
 }
 
-func (cv connectionVisitor) checkKey(k key, path string) error {
-	defer func() { cv.keyPaths[k] = path }()
+func (cv connectionVisitor) checkKey(k key, path string) {
 	if conflict, ok := cv.keyPaths[k]; ok {
-		return newErrInvalidInput(fmt.Sprintf("cannot provide %v from %v", k, path),
-			newErrInvalidInput(fmt.Sprintf("already provided by %v", conflict), nil))
+		*cv.conflicts = append(*cv.conflicts, provideConflict{
+			Key:      k,
+			Path:     path,
+			Existing: conflict,
+		})
+		return
 	}
+
 	if ps := cv.s.providers[k]; len(ps) > 0 {
 		cons := make([]string, len(ps))
 		for i, p := range ps {
 			cons[i] = fmt.Sprint(p.Location())
 		}
+		// Locations are sorted so that the message does not depend on the
+		// order in which providers happened to be registered.
+		sort.Strings(cons)
 
-		return newErrInvalidInput(fmt.Sprintf("cannot provide %v from %v", k, path),
-			newErrInvalidInput(fmt.Sprintf("already provided by %v", strings.Join(cons, "; ")), nil))
+		*cv.conflicts = append(*cv.conflicts, provideConflict{
+			Key:      k,
+			Path:     path,
+			Existing: strings.Join(cons, "; "),
+		})
+		return
 	}
-	return nil
+
+	cv.keyPaths[k] = path
 }

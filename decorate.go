@@ -51,8 +51,13 @@ type decoratorNode struct {
 	// Location where this function was defined.
 	location *digreflect.Func
 
-	// Current state of this decorator
+	// Current state of this decorator.
 	state decoratorState
+
+	// Generation of the graph at which this decorator last completed.
+	// A decorator is applied at most once per type per generation, and is
+	// applied again after the graph changes.
+	calledAt int
 
 	// Parameters of the decorator.
 	params paramList
@@ -104,11 +109,19 @@ func newDecoratorNode(dcor interface{}, s *Scope, opts decorateOptions) (*decora
 }
 
 func (n *decoratorNode) Call(s containerStore) (err error) {
-	if n.state == decoratorCalled {
+	gen := n.s.currentGeneration()
+	if n.state == decoratorCalled && n.calledAt == gen {
 		return nil
 	}
 
 	n.state = decoratorOnStack
+	// If this call fails, leave the decorator ready so that a later
+	// resolution can try again, instead of leaving it stuck on the stack.
+	defer func() {
+		if err != nil {
+			n.state = decoratorReady
+		}
+	}()
 
 	if err := shallowCheckDependencies(s, n.params); err != nil {
 		return errMissingDependencies{
@@ -154,16 +167,29 @@ func (n *decoratorNode) Call(s containerStore) (err error) {
 	}
 
 	results := s.invoker()(reflect.ValueOf(n.dcor), args)
-	if err = n.results.ExtractList(n.s, true /* decorated */, results); err != nil {
+	// Buffer the decorated values so that a decorator returning an error
+	// does not leave partial results behind. Otherwise a retry on the next
+	// resolution would observe stale or empty decorated values.
+	receiver := newStagingDecoratedContainerWriter()
+	if err = n.results.ExtractList(receiver, true /* decorated */, results); err != nil {
 		return err
 	}
+	receiver.Commit(n.s)
 	n.state = decoratorCalled
+	n.calledAt = gen
 	return nil
 }
 
 func (n *decoratorNode) ID() dot.CtorID { return n.id }
 
-func (n *decoratorNode) State() decoratorState { return n.state }
+func (n *decoratorNode) State() decoratorState {
+	// A decorator from an older generation is treated as not called, so
+	// that it is applied again against the current graph.
+	if n.state == decoratorCalled && n.calledAt != n.s.currentGeneration() {
+		return decoratorReady
+	}
+	return n.state
+}
 
 // DecorateOption modifies the default behavior of Decorate.
 type DecorateOption interface {
@@ -243,12 +269,32 @@ func (c *Container) Decorate(decorator interface{}, opts ...DecorateOption) erro
 //
 // Decorating a Scope affects all the child scopes of this Scope.
 //
-// Similar to a provider, the decorator function gets called *at most once*.
+// Similar to a provider, the decorator function gets called *at most once*
+// per type for a given version of the graph. If new providers or decorators
+// are added to the Scope afterwards, the decorator is called again on the
+// next resolution so that it observes the updated graph.
 func (s *Scope) Decorate(decorator interface{}, opts ...DecorateOption) error {
 	var options decorateOptions
 	for _, opt := range opts {
 		opt.apply(&options)
 	}
+
+	// Building the decorator node may add value group nodes to the graph
+	// (via its parameters). If decorating is rejected, those nodes must not
+	// remain in the candidate graph.
+	allScopes := s.appendSubscopes(nil)
+	for _, sc := range allScopes {
+		sc.gh.Snapshot()
+	}
+	committed := false
+	defer func() {
+		if committed {
+			return
+		}
+		for _, sc := range allScopes {
+			sc.gh.Rollback()
+		}
+	}()
 
 	dn, err := newDecoratorNode(decorator, s, options)
 	if err != nil {
@@ -259,13 +305,25 @@ func (s *Scope) Decorate(decorator interface{}, opts ...DecorateOption) error {
 	if err != nil {
 		return err
 	}
+
+	// Validate every key before committing any of them, so that a decorator
+	// that conflicts on one of its results does not leave the Scope
+	// partially decorated.
 	for _, k := range keys {
 		if _, ok := s.decorators[k]; ok {
 			return newErrInvalidInput(
 				fmt.Sprintf("cannot decorate using function %v: %s already decorated", dn.dtype, k), nil)
 		}
+	}
+	for _, k := range keys {
 		s.decorators[k] = dn
 	}
+	committed = true
+
+	// The graph changed: other decorators must be applied again on the next
+	// resolution, and values produced by this one must not be reused from an
+	// earlier generation.
+	s.bumpGeneration()
 
 	if info := options.Info; info != nil {
 		params := dn.params.DotParam()

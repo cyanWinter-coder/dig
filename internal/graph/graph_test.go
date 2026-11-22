@@ -155,3 +155,113 @@ func TestGraphIsCyclic(t *testing.T) {
 		assert.Equal(t, tt.cycle, c)
 	}
 }
+
+func TestFindCycles(t *testing.T) {
+	testCases := []struct {
+		desc  string
+		edges [][]int
+
+		// wantCycles lists the expected cycles in order. Each cycle is
+		// expected to start and end with its smallest node.
+		wantCycles [][]int
+	}{
+		{
+			desc:  "empty graph",
+			edges: nil,
+		},
+		{
+			desc: "acyclic graph",
+			edges: [][]int{
+				{1, 2},
+				{2},
+				nil,
+			},
+		},
+		{
+			desc: "self cycle",
+			edges: [][]int{
+				{0},
+			},
+			wantCycles: [][]int{{0, 0}},
+		},
+		{
+			desc: "single cycle",
+			edges: [][]int{
+				{1},
+				{2},
+				{3},
+				{0},
+			},
+			wantCycles: [][]int{{0, 1, 2, 3, 0}},
+		},
+		{
+			desc: "cycle reported after unreachable acyclic nodes",
+			edges: [][]int{
+				{1},
+				nil,
+				{3},
+				{2},
+			},
+			wantCycles: [][]int{{2, 3, 2}},
+		},
+		{
+			desc: "multiple independent cycles",
+			edges: [][]int{
+				{1},
+				{0},
+				{3},
+				{2},
+			},
+			wantCycles: [][]int{
+				{0, 1, 0},
+				{2, 3, 2},
+			},
+		},
+		{
+			desc: "overlapping cycle reports one representative per component",
+			edges: [][]int{
+				{1, 2},
+				{2},
+				{1},
+			},
+			wantCycles: [][]int{{1, 2, 1}},
+		},
+		{
+			// Duplicate edges must not be reported as cycles or cause
+			// duplicate path entries.
+			desc: "duplicate edges are deduplicated",
+			edges: [][]int{
+				{1, 1},
+				{0, 0},
+			},
+			wantCycles: [][]int{{0, 1, 0}},
+		},
+		{
+			// The reported cycle must start at the lowest node in the
+			// component regardless of the order edges were declared in.
+			desc: "cycle starts at smallest node",
+			edges: [][]int{
+				nil,
+				{2},
+				{1},
+			},
+			wantCycles: [][]int{{1, 2, 1}},
+		},
+		{
+			desc: "out of range edges are ignored",
+			edges: [][]int{
+				{5},
+			},
+		},
+	}
+
+	for _, tt := range testCases {
+		t.Run(tt.desc, func(t *testing.T) {
+			g := newTestGraph()
+			for i, neighbors := range tt.edges {
+				g.Nodes[i] = neighbors
+			}
+			assert.Equal(t, tt.wantCycles, FindCycles(g))
+		})
+	}
+}

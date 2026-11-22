@@ -20,7 +20,11 @@
 
 package dig
 
-import "go.uber.org/dig/internal/graph"
+import (
+	"sort"
+
+	"go.uber.org/dig/internal/graph"
+)
 
 // graphNode is a single node in the dependency graph.
 type graphNode struct {
@@ -61,6 +65,10 @@ func (gh *graphHolder) Order() int { return len(gh.nodes) }
 //
 // For value group nodes, it retrieves the group providers from the container
 // and reports their orders.
+//
+// The returned orders are deterministically sorted and free of duplicates, so
+// that cycle detection and error reporting do not depend on the order in which
+// providers were registered or parameters were visited.
 func (gh *graphHolder) EdgesFrom(u int) []int {
 	var orders []int
 	switch w := gh.Lookup(u).(type) {
@@ -74,7 +82,23 @@ func (gh *graphHolder) EdgesFrom(u int) []int {
 			orders = append(orders, provider.Order(gh.s))
 		}
 	}
-	return orders
+	return sortedUnique(orders)
+}
+
+// sortedUnique returns the values of xs in ascending order with duplicates
+// removed.
+func sortedUnique(xs []int) []int {
+	if len(xs) < 2 {
+		return xs
+	}
+	sort.Ints(xs)
+	out := xs[:1]
+	for _, x := range xs[1:] {
+		if x != out[len(out)-1] {
+			out = append(out, x)
+		}
+	}
+	return out
 }
 
 // NewNode adds a new value to the graph and returns its order.

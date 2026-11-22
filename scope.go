@@ -95,6 +95,12 @@ type Scope struct {
 
 	// clockSrc stores the source of time. Defaults to system clock.
 	clockSrc digclock.Clock
+
+	// generation is a monotonic counter of committed changes to the graph.
+	// It lives on the root Scope and is shared by all of its descendants.
+	// Decorators are applied at most once per type per generation, and are
+	// applied again after the graph changes.
+	generation int
 }
 
 func newScope() *Scope {
@@ -130,8 +136,13 @@ func (s *Scope) Scope(name string, opts ...ScopeOption) *Scope {
 	// child copies the parent's graph nodes.
 	for _, node := range s.gh.nodes {
 		child.gh.nodes = append(child.gh.nodes, node)
-		if ctrNode, ok := node.Wrapped.(*constructorNode); ok {
-			ctrNode.CopyOrder(s, child)
+		// Nodes must retain their order in the child scope. Otherwise,
+		// every copied node would report order 0 for the child, and
+		// cycle detection would report edges that do not exist.
+		if orderer, ok := node.Wrapped.(interface {
+			CopyOrder(parent, child *Scope)
+		}); ok {
+			orderer.CopyOrder(s, child)
 		}
 	}
 
@@ -287,19 +298,94 @@ func (s *Scope) newGraphNode(wrapped interface{}, orders map[*Scope]int) {
 	}
 }
 
-func (s *Scope) cycleDetectedError(cycle []int) error {
-	var path []cycleErrPathEntry
-	for _, n := range cycle {
-		if n, ok := s.gh.Lookup(n).(*constructorNode); ok {
-			path = append(path, cycleErrPathEntry{
-				Key: key{
-					t: n.CType(),
-				},
-				Func: n.Location(),
-			})
+// cycleDetectedError builds an error that describes all the cycles found in
+// this Scope's graph.
+//
+// Value group nodes are part of the graph so that cycles can pass through
+// them, but they do not correspond to user-provided functions. They are
+// omitted from the reported path. Each cycle is rotated to start at its
+// lowest constructor node so that the reported paths are deterministic and
+// always contain the constructor that closes the cycle at both ends.
+func (s *Scope) cycleDetectedError(cycles [][]int) error {
+	paths := make([][]cycleErrPathEntry, 0, len(cycles))
+	for _, cycle := range cycles {
+		if path := s.cyclePath(cycle); len(path) > 0 {
+			paths = append(paths, path)
 		}
 	}
-	return errCycleDetected{Path: path, scope: s}
+	return errCycleDetected{Paths: paths, scope: s}
+}
+
+// cyclePath converts a cycle expressed as graph orders into the list of
+// constructors that participate in it.
+func (s *Scope) cyclePath(cycle []int) []cycleErrPathEntry {
+	if len(cycle) < 2 {
+		return nil
+	}
+
+	// The last element repeats the first one.
+	nodes := cycle[:len(cycle)-1]
+
+	// Rotate the cycle so that it starts at its lowest constructor node.
+	// This keeps the reported path deterministic even when the cycle was
+	// discovered through a value group node.
+	start := -1
+	for i, n := range nodes {
+		if _, ok := s.gh.Lookup(n).(*constructorNode); !ok {
+			continue
+		}
+		if start < 0 || n < nodes[start] {
+			start = i
+		}
+	}
+	if start < 0 {
+		// A cycle always contains at least one constructor, but guard
+		// against unexpected graph shapes.
+		return nil
+	}
+	rotated := make([]int, 0, len(nodes)+1)
+	rotated = append(rotated, nodes[start:]...)
+	rotated = append(rotated, nodes[:start]...)
+	rotated = append(rotated, rotated[0])
+
+	var path []cycleErrPathEntry
+	for _, n := range rotated {
+		node, ok := s.gh.Lookup(n).(*constructorNode)
+		if !ok {
+			// Value group nodes are not user-provided functions.
+			continue
+		}
+		path = append(path, cycleErrPathEntry{
+			Key:  key{t: node.CType()},
+			Func: node.Location(),
+		})
+	}
+	return path
+}
+
+// currentGeneration returns the generation of the root Scope's graph.
+func (s *Scope) currentGeneration() int {
+	return s.rootScope().generation
+}
+
+// bumpGeneration records that the graph changed, invalidating decorator
+// results computed against the previous graph.
+//
+// Values produced by constructors remain valid across generations: a
+// constructor is still called at most once. Values produced by decorators are
+// derived from the graph, so they are discarded and recomputed the next time
+// they are requested, against the new generation.
+func (s *Scope) bumpGeneration() {
+	root := s.rootScope()
+	root.generation++
+	for _, sc := range root.appendSubscopes(nil) {
+		for k := range sc.decoratedValues {
+			delete(sc.decoratedValues, k)
+		}
+		for k := range sc.decoratedGroups {
+			delete(sc.decoratedGroups, k)
+		}
+	}
 }
 
 // Returns the root Scope that can be reached from this Scope.

@@ -114,8 +114,8 @@ func (s *Scope) Invoke(function interface{}, opts ...InvokeOption) (err error) {
 	}
 
 	if !s.isVerifiedAcyclic {
-		if ok, cycle := graph.IsAcyclic(s.gh); !ok {
-			return newErrInvalidInput("cycle detected in dependency graph", s.cycleDetectedError(cycle))
+		if cycles := graph.FindCycles(s.gh); len(cycles) > 0 {
+			return newErrInvalidInput("cycle detected in dependency graph", s.cycleDetectedError(cycles))
 		}
 		s.isVerifiedAcyclic = true
 	}

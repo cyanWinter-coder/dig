@@ -938,3 +938,144 @@ func TestFillDecorateInfoString(t *testing.T) {
 		assert.Contains(t, fmt.Sprint(opt), "FillDecorateInfo(0x")
 	})
 }
+
+// TestDecoratePerGeneration verifies that a decorator is applied once per
+// type per generation, and applied again when the graph it decorates changes.
+func TestDecoratePerGeneration(t *testing.T) {
+	t.Parallel()
+
+	t.Run("decorator is not re-applied without a graph change", func(t *testing.T) {
+		t.Parallel()
+
+		type A struct{ value int }
+
+		c := digtest.New(t)
+		c.RequireProvide(func() A { return A{value: 1} })
+
+		calls := 0
+		c.RequireDecorate(func(a A) A {
+			calls++
+			return A{value: a.value + 10}
+		})
+
+		for i := 0; i < 3; i++ {
+			c.RequireInvoke(func(a A) {
+				assert.Equal(t, 11, a.value, "decorator must be applied exactly once")
+			})
+		}
+		assert.Equal(t, 1, calls, "decorator must run once per generation")
+	})
+
+	t.Run("decorator is re-applied after a new provider is added", func(t *testing.T) {
+		t.Parallel()
+
+		type elem struct{ value int }
+
+		type decIn struct {
+			dig.In
+
+			Elems []elem `group:"elems"`
+		}
+		type decOut struct {
+			dig.Out
+
+			Elems []elem `group:"elems"`
+		}
+
+		c := digtest.New(t)
+		c.RequireProvide(func() elem { return elem{value: 1} }, dig.Group("elems"))
+
+		calls := 0
+		c.RequireDecorate(func(i decIn) decOut {
+			calls++
+			return decOut{Elems: i.Elems}
+		})
+
+		c.RequireInvoke(func(i decIn) {
+			assert.Equal(t, []elem{{value: 1}}, i.Elems)
+		})
+		assert.Equal(t, 1, calls)
+
+		// A new group element changes the graph: the decorator must observe
+		// it on the next resolution instead of returning a stale result.
+		c.RequireProvide(func() elem { return elem{value: 2} }, dig.Group("elems"))
+		c.RequireInvoke(func(i decIn) {
+			assert.ElementsMatch(t, []elem{{value: 1}, {value: 2}}, i.Elems)
+		})
+		assert.Equal(t, 2, calls, "decorator must run again after the graph changes")
+
+		// No further changes: the decorator is not re-applied.
+		c.RequireInvoke(func(i decIn) {
+			assert.ElementsMatch(t, []elem{{value: 1}, {value: 2}}, i.Elems)
+		})
+		assert.Equal(t, 2, calls, "decorator must run at most once per generation")
+	})
+
+	t.Run("failed decorator is retried on the next resolution", func(t *testing.T) {
+		t.Parallel()
+
+		type A struct{ value int }
+
+		c := digtest.New(t)
+		c.RequireProvide(func() A { return A{value: 1} })
+
+		fail := true
+		calls := 0
+		c.RequireDecorate(func(a A) (A, error) {
+			calls++
+			if fail {
+				return A{}, errors.New("great sadness")
+			}
+			return A{value: a.value + 10}, nil
+		})
+
+		require.Error(t, c.Invoke(func(A) {}), "expected the decorator to fail")
+		assert.Equal(t, 1, calls)
+
+		// A failed decoration must not be cached as successful.
+		fail = false
+		c.RequireInvoke(func(a A) {
+			assert.Equal(t, 11, a.value, "decorator must be retried after a failure")
+		})
+		assert.Equal(t, 2, calls)
+	})
+}
+
+// TestDecorateRejectedIsRolledBack verifies that a rejected Decorate does not
+// leave value group nodes behind in the graph.
+func TestDecorateRejectedIsRolledBack(t *testing.T) {
+	t.Parallel()
+
+	type A struct{}
+
+	type decIn struct {
+		dig.In
+
+		As []A `group:"as"`
+	}
+
+	c := digtest.New(t)
+	c.RequireProvide(func() A { return A{} }, dig.Group("as"))
+	c.RequireDecorate(func(decIn) []A { return nil })
+
+	// The second decorator conflicts on A; it must be rejected without
+	// changing the graph.
+	err := c.Decorate(func(decIn) []A { return nil })
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "already decorated")
+
+	// Visualization must match the successfully committed graph: the group
+	// node from the group provider and the first decorator is present, and
+	// the rejected decorator adds nothing.
+	want := digtest.New(t)
+	want.RequireProvide(func() A { return A{} }, dig.Group("as"))
+	want.RequireDecorate(func(decIn) []A { return nil })
+
+	countGroups := func(c *dig.Container) int {
+		var b strings.Builder
+		require.NoError(t, dig.Visualize(c, &b))
+		return strings.Count(b.String(), "[shape=diamond")
+	}
+	assert.Equal(t, countGroups(want.Container), countGroups(c.Container),
+		"rejected decorator must not add a group node")
+}

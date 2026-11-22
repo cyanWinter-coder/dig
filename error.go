@@ -193,6 +193,58 @@ func (e errInvalidInput) Format(w fmt.State, c rune) {
 	formatError(e, w, c)
 }
 
+// errProvideConflicts is returned when a constructor provides a value that was
+// already provided, either by an earlier result of the same constructor or by
+// a constructor already registered in the Scope.
+//
+// All conflicts found in the candidate graph are reported together in a
+// deterministic order, so that a single error describes every conflicting
+// value and prevents the candidate graph from being committed.
+type errProvideConflicts []provideConflict
+
+var _ digError = errProvideConflicts(nil)
+
+func (e errProvideConflicts) Error() string { return fmt.Sprint(e) }
+
+func (e errProvideConflicts) writeMessage(w io.Writer, verb string) {
+	multiline := verb == "%+v"
+	for i, c := range e {
+		if i > 0 {
+			if multiline {
+				io.WriteString(w, "\n")
+			} else {
+				io.WriteString(w, "; ")
+			}
+		}
+		fmt.Fprintf(w, "cannot provide %v from %v", c.Key, c.Path)
+		if multiline {
+			io.WriteString(w, ":\n")
+		} else {
+			io.WriteString(w, ": ")
+		}
+		fmt.Fprintf(w, "already provided by %v", c.Existing)
+	}
+}
+
+func (e errProvideConflicts) Format(w fmt.State, c rune) {
+	formatError(e, w, c)
+}
+
+// Len, Less, and Swap make conflicts sortable so that the reported order is
+// independent of result-walking and provider-registration order.
+func (e errProvideConflicts) Len() int { return len(e) }
+
+func (e errProvideConflicts) Less(i, j int) bool {
+	if e[i].Key.String() != e[j].Key.String() {
+		return e[i].Key.String() < e[j].Key.String()
+	}
+	if e[i].Path != e[j].Path {
+		return e[i].Path < e[j].Path
+	}
+	return e[i].Existing < e[j].Existing
+}
+func (e errProvideConflicts) Swap(i, j int) { e[i], e[j] = e[j], e[i] }
+
 // errProvide is returned when a constructor could not be Provided into the
 // container.
 type errProvide struct {

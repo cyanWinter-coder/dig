@@ -413,4 +413,30 @@ func TestFalsePositiveScopeCycleDetection(t *testing.T) {
 		// would both have order 0 for child scope.
 		child.RequireProvide(func() float32 { return 0 })
 	})
+
+	t.Run("inherited value group node", func(t *testing.T) {
+		// A value group node created in the parent must retain its order in
+		// the child. Otherwise its edges point at the wrong node and cycle
+		// detection reports edges that do not exist.
+		type X struct{}
+		type A struct{}
+		type Y struct{}
+
+		type in struct {
+			dig.In
+
+			Ints []int `group:"g"`
+		}
+
+		root := digtest.New(t)
+		root.RequireProvide(func(A) X { return X{} })
+		root.RequireProvide(func() int { return 1 }, dig.Group("g"))
+		root.RequireProvide(func(in) A { return A{} })
+
+		// The child inherits a graph in which A depends on the group node,
+		// which provides values without depending on A. This is acyclic.
+		child := root.Scope("child")
+		child.RequireProvide(func() Y { return Y{} })
+		child.RequireInvoke(func(A) {})
+	})
 }

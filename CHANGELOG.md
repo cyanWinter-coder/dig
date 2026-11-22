@@ -5,7 +5,21 @@ The format is based on [Keep a Changelog](http://keepachangelog.com/en/1.0.0/)
 and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.html).
 
 ## Unreleased
-- No changes yet.
+
+### Fixed
+- Providing a constructor that conflicts with existing values now reports every
+  conflicting value in a deterministic order instead of stopping at the first
+  one.
+- Cycle detection now reports all independent cycles, including cycles that pass
+  through value groups, and cycle paths no longer collapse to a single node.
+- A rejected `Provide` (for example, one that introduces a cycle) is no longer
+  partially committed: the graph, providers, and visualization reflect only
+  constructors that were accepted.
+- Value group nodes are no longer given a false order in scopes that inherit
+  them, which previously produced spurious cycle errors.
+- Decorators are applied at most once per type per graph version and are
+  re-applied after the graph changes, so they no longer return stale values.
+  A decorator that fails no longer caches partial results or stays stuck.
 
 ## [1.19.0] - 2025-05-13
 
