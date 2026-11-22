@@ -403,7 +403,13 @@ func (c *Container) Provide(constructor interface{}, opts ...ProvideOption) erro
 // Scopes that are descendents, but not ancestors of this Scope.
 // To provide a constructor to all the Scopes available, provide it to
 // Container, which is the root Scope.
+//
+// Provide is serialized against resolutions of the container issued from
+// other goroutines.
 func (s *Scope) Provide(constructor interface{}, opts ...ProvideOption) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	ctype := reflect.TypeOf(constructor)
 	if ctype == nil {
 		return newErrInvalidInput("can't provide an untyped nil", nil)

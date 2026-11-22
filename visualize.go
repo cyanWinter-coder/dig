@@ -94,6 +94,9 @@ func updateGraph(dg *dot.Graph, err error) error {
 // Visualize parses the graph in Container c into DOT format and writes it to
 // io.Writer w.
 func Visualize(c *Container, w io.Writer, opts ...VisualizeOption) error {
+	c.scope.mu.Lock()
+	defer c.scope.mu.Unlock()
+
 	dg := c.createGraph()
 
 	var options visualizeOptions

@@ -91,7 +91,22 @@ func (c *Container) Invoke(function interface{}, opts ...InvokeOption) error {
 //
 // The function may return an error to indicate failure. The error will be
 // returned to the caller as-is.
+//
+// Invoke is serialized against other resolutions and graph mutations
+// (Provide, Decorate) of the container issued from other goroutines: once
+// a resolution begins, the decoration chain is frozen, and a concurrent
+// Decorate takes effect only for subsequent resolutions. Invokes nested on
+// the same goroutine, e.g. an Invoke from inside a function being invoked,
+// are still permitted.
 func (s *Scope) Invoke(function interface{}, opts ...InvokeOption) (err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// Start a new resolution generation. Decorators record the generation
+	// in which they were applied so that each decorator is applied at
+	// most once per resolution.
+	s.rootScope().resolutionGen++
+
 	ftype := reflect.TypeOf(function)
 	if ftype == nil {
 		return newErrInvalidInput("can't invoke an untyped nil", nil)

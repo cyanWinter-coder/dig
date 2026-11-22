@@ -95,6 +95,32 @@ type Scope struct {
 
 	// clockSrc stores the source of time. Defaults to system clock.
 	clockSrc digclock.Clock
+
+	// mu serializes graph mutations (Provide, Decorate, Scope) against
+	// resolutions (Invoke) so that concurrent use of the container is
+	// published in a deterministic order. The mutex is shared by all the
+	// scopes in a scope tree and is owned by the root scope.
+	//
+	// Because the lock is held for the duration of a resolution, the
+	// decoration chain is frozen once a resolution begins: a Decorate
+	// issued while a resolution is in progress blocks until the
+	// resolution completes and only affects subsequent resolutions.
+	//
+	// The mutex is reentrant so that a goroutine may issue nested
+	// resolutions, e.g. an Invoke from inside a function that is itself
+	// being invoked. Blocking on the container from a different goroutine
+	// than the one resolving will deadlock.
+	mu *reentrantMutex
+
+	// resolutionGen is the generation of the resolution currently in
+	// progress in this scope tree. It is incremented once per Invoke.
+	// Only the root scope's counter is used.
+	resolutionGen uint64
+
+	// decorationGen records, for each key decorated in this Scope, the
+	// resolution generation in which the decoration was applied. A
+	// decorator is applied at most once per resolution.
+	decorationGen map[key]uint64
 }
 
 func newScope() *Scope {
@@ -105,9 +131,11 @@ func newScope() *Scope {
 		decoratedValues: make(map[key]reflect.Value),
 		groups:          make(map[key][]reflect.Value),
 		decoratedGroups: make(map[key]reflect.Value),
+		decorationGen:   make(map[key]uint64),
 		invokerFn:       defaultInvoker,
 		rand:            rand.New(rand.NewSource(time.Now().UnixNano())),
 		clockSrc:        digclock.System,
+		mu:              &reentrantMutex{},
 	}
 	s.gh = newGraphHolder(s)
 	return s
@@ -119,6 +147,9 @@ func newScope() *Scope {
 // However, no modifications made to the child scope being created will be propagated
 // to the parent Scope.
 func (s *Scope) Scope(name string, opts ...ScopeOption) *Scope {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	child := newScope()
 	child.name = name
 	child.parentScope = s
@@ -126,6 +157,7 @@ func (s *Scope) Scope(name string, opts ...ScopeOption) *Scope {
 	child.clockSrc = s.clockSrc
 	child.deferAcyclicVerification = s.deferAcyclicVerification
 	child.recoverFromPanics = s.recoverFromPanics
+	child.mu = s.mu
 
 	// child copies the parent's graph nodes.
 	for _, node := range s.gh.nodes {
@@ -242,6 +274,25 @@ func (s *Scope) getGroupDecorator(name string, t reflect.Type) (decorator, bool)
 func (s *Scope) getDecorators(k key) (decorator, bool) {
 	d, found := s.decorators[k]
 	return d, found
+}
+
+// currentGen returns the generation of the resolution currently in
+// progress in this scope tree, or zero if no resolution has started yet.
+func (s *Scope) currentGen() uint64 {
+	return s.rootScope().resolutionGen
+}
+
+// decorationApplied reports whether the decorator for the given key was
+// already applied in this Scope during the given resolution generation.
+func (s *Scope) decorationApplied(k key, gen uint64) bool {
+	genApplied, ok := s.decorationGen[k]
+	return ok && genApplied == gen
+}
+
+// recordDecoration records that the decorator for the given key was
+// applied in this Scope during the given resolution generation.
+func (s *Scope) recordDecoration(k key, gen uint64) {
+	s.decorationGen[k] = gen
 }
 
 func (s *Scope) getProviders(k key) []provider {

@@ -5,7 +5,21 @@ The format is based on [Keep a Changelog](http://keepachangelog.com/en/1.0.0/)
 and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.html).
 
 ## Unreleased
-- No changes yet.
+
+### Changed
+- Decorations are now applied at most once per resolution: each scope records
+  the resolution generation in which a decorator was applied, so concurrent
+  resolutions can never apply the same decorator twice or observe different
+  versions of the decorated value.
+- `Provide`, `Decorate`, `Scope`, and `Invoke` are now serialized
+  container-wide. A `Decorate` issued while a resolution is in progress
+  takes effect only for subsequent resolutions, and conflicting concurrent
+  `Decorate` calls fail with an error naming the conflicting type.
+
+### Fixed
+- A decorator that returns an error no longer partially commits its results
+  nor gets stuck on the resolution stack: the original, undecorated graph
+  remains usable and the decoration is retried by the next resolution.
 
 ## [1.19.0] - 2025-05-13
 

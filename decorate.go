@@ -63,6 +63,11 @@ type decoratorNode struct {
 	// Order of this node in each Scopes' graphHolders.
 	orders map[*Scope]int
 
+	// keys produced by this decorator, as registered in the Scope's
+	// decorators map. Used to record the resolution generation in which
+	// this decorator was applied.
+	keys []key
+
 	// Scope this node was originally provided to.
 	s *Scope
 
@@ -108,7 +113,23 @@ func (n *decoratorNode) Call(s containerStore) (err error) {
 		return nil
 	}
 
+	// A decorator is applied at most once per resolution: if this store
+	// already recorded an application of this decorator for every key it
+	// produces in the current resolution generation, skip it.
+	if gen := s.currentGen(); gen != 0 && n.appliedIn(s, gen) {
+		return nil
+	}
+
 	n.state = decoratorOnStack
+
+	// If the decoration fails, roll back to the ready state so that the
+	// original, undecorated graph remains usable and a later resolution
+	// may retry the decoration.
+	defer func() {
+		if err != nil {
+			n.state = decoratorReady
+		}
+	}()
 
 	if err := shallowCheckDependencies(s, n.params); err != nil {
 		return errMissingDependencies{
@@ -154,11 +175,36 @@ func (n *decoratorNode) Call(s containerStore) (err error) {
 	}
 
 	results := s.invoker()(reflect.ValueOf(n.dcor), args)
-	if err = n.results.ExtractList(n.s, true /* decorated */, results); err != nil {
+
+	// Stage the decorated values so that a failing decorator does not
+	// partially replace the original instances.
+	receiver := newStagingContainerWriter()
+	if err = n.results.ExtractList(receiver, true /* decorated */, results); err != nil {
 		return err
 	}
+	receiver.Commit(n.s)
+
 	n.state = decoratorCalled
+	if gen := s.currentGen(); gen != 0 {
+		for _, k := range n.keys {
+			s.recordDecoration(k, gen)
+		}
+	}
 	return nil
+}
+
+// appliedIn reports whether this decorator was already applied to all of
+// its keys in the given resolution generation.
+func (n *decoratorNode) appliedIn(s containerStore, gen uint64) bool {
+	if len(n.keys) == 0 {
+		return false
+	}
+	for _, k := range n.keys {
+		if !s.decorationApplied(k, gen) {
+			return false
+		}
+	}
+	return true
 }
 
 func (n *decoratorNode) ID() dot.CtorID { return n.id }
@@ -244,7 +290,14 @@ func (c *Container) Decorate(decorator interface{}, opts ...DecorateOption) erro
 // Decorating a Scope affects all the child scopes of this Scope.
 //
 // Similar to a provider, the decorator function gets called *at most once*.
+//
+// Decorate is serialized against resolutions of the container: a Decorate
+// issued from another goroutine while an Invoke is in progress takes effect
+// only for subsequent resolutions.
 func (s *Scope) Decorate(decorator interface{}, opts ...DecorateOption) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	var options decorateOptions
 	for _, opt := range opts {
 		opt.apply(&options)
@@ -266,6 +319,7 @@ func (s *Scope) Decorate(decorator interface{}, opts ...DecorateOption) error {
 		}
 		s.decorators[k] = dn
 	}
+	dn.keys = keys
 
 	if info := options.Info; info != nil {
 		params := dn.params.DotParam()

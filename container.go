@@ -134,6 +134,19 @@ type containerStore interface {
 	// type.
 	getGroupDecorator(name string, t reflect.Type) (decorator, bool)
 
+	// currentGen returns the generation of the resolution currently in
+	// progress in this store's scope tree, or zero if no resolution has
+	// started yet.
+	currentGen() uint64
+
+	// decorationApplied reports whether the decorator for the given key was
+	// already applied in this store during the given resolution generation.
+	decorationApplied(k key, gen uint64) bool
+
+	// recordDecoration records that the decorator for the given key was
+	// applied in this store during the given resolution generation.
+	recordDecoration(k key, gen uint64)
+
 	// Reports a list of stores (starting at this store) up to the root
 	// store.
 	storesToRoot() []containerStore
