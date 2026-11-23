@@ -58,10 +58,10 @@ func TestNodeAlreadyCalled(t *testing.T) {
 	s := newScope()
 	n, err := newConstructorNode(f, s, s, constructorOptions{})
 	require.NoError(t, err, "failed to build node")
-	require.False(t, n.called, "node must not have been called")
+	require.False(t, s.hasCalled(n), "node must not have been called")
 
 	c := New()
 	require.NoError(t, n.Call(c.scope), "invoke failed")
-	require.True(t, n.called, "node must be called")
+	require.True(t, c.scope.hasCalled(n), "node must be called")
 	require.NoError(t, n.Call(c.scope), "calling again should be okay")
 }

@@ -5,7 +5,31 @@ The format is based on [Keep a Changelog](http://keepachangelog.com/en/1.0.0/)
 and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.html).
 
 ## Unreleased
-- No changes yet.
+
+### Added
+- `Scope.Close` releases the values cached in a request Scope, and
+  `Scope.IsClosed` reports whether it was closed. A closed Scope rejects
+  `Invoke` instead of returning stale instances, and a new Scope created from
+  the same parent builds independent instances.
+
+### Fixed
+- Values constructed while resolving a `Scope` are now owned by that `Scope`
+  instead of the `Scope` the constructor was provided to. A constructor runs
+  at most once per `Scope`, and its instance is reused only within that
+  `Scope` and its descendants. Sibling and parent `Scope`s no longer receive
+  a request's instance, and the single instance a parent publishes remains
+  shared with its descendants.
+- A failed `Invoke` now rolls back every value it constructed, including
+  transitive dependencies, value group elements, decorated values, and the
+  record of completed constructor calls. A failed request no longer modifies
+  its parent's cache or a sibling `Scope`, and the next resolution retries
+  the constructors that failed.
+- A single `Invoke` now resolves every constructor, value group, decorator,
+  and callback against one fixed chain of `Scope`s, so they all observe the
+  same graph even if more `Scope`s are created concurrently.
+- Value group elements are attributed to the constructor that produced them,
+  so a request no longer reports the same provider's element twice when both
+  an ancestor and the request constructed it.
 
 ## [1.19.0] - 2025-05-13
 

@@ -403,6 +403,12 @@ func (c *Container) Provide(constructor interface{}, opts ...ProvideOption) erro
 // Scopes that are descendents, but not ancestors of this Scope.
 // To provide a constructor to all the Scopes available, provide it to
 // Container, which is the root Scope.
+//
+// The value a constructor produces belongs to the Scope that resolves it.
+// A Scope that resolves a constructor caches the resulting instance and
+// shares it with its descendants; a sibling Scope that resolves the same
+// constructor builds an independent instance. Providing a constructor to the
+// root Container is therefore how a singleton is shared by the whole tree.
 func (s *Scope) Provide(constructor interface{}, opts ...ProvideOption) error {
 	ctype := reflect.TypeOf(constructor)
 	if ctype == nil {
@@ -499,7 +505,7 @@ func (s *Scope) provide(ctor interface{}, opts provideOptions) (err error) {
 	}
 
 	for _, s := range allScopes {
-		s.isVerifiedAcyclic = false
+		s.isVerifiedAcyclic.Store(false)
 		if s.deferAcyclicVerification {
 			continue
 		}
@@ -513,7 +519,7 @@ func (s *Scope) provide(ctor interface{}, opts provideOptions) (err error) {
 
 			return newErrInvalidInput("this function introduces a cycle", s.cycleDetectedError(cycle))
 		}
-		s.isVerifiedAcyclic = true
+		s.isVerifiedAcyclic.Store(true)
 	}
 
 	s.nodes = append(s.nodes, n)

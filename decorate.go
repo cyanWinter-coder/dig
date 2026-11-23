@@ -103,21 +103,46 @@ func newDecoratorNode(dcor interface{}, s *Scope, opts decorateOptions) (*decora
 	return n, nil
 }
 
-func (n *decoratorNode) Call(s containerStore) (err error) {
+func (n *decoratorNode) Call(c containerStore) (err error) {
 	if n.state == decoratorCalled {
 		return nil
 	}
 
+	// Decorator state is global to the node, so it is restored if this
+	// resolution fails: a decorator that returns an error must not stay on
+	// the stack, and a decoration that is rolled back must be retried by
+	// the next resolution.
+	prevState := n.state
 	n.state = decoratorOnStack
+	res := resolutionOf(c)
+	if res != nil {
+		res.record(func() { n.state = prevState })
+	} else {
+		defer func() {
+			if err != nil {
+				n.state = prevState
+			}
+		}()
+	}
 
-	if err := shallowCheckDependencies(s, n.params); err != nil {
+	// The decorator resolves its own inputs against its Scope's view, as
+	// it always has, but publishes its results through the resolution so
+	// that they are rolled back together with the rest of the Invoke.
+	view := c
+	if res != nil {
+		view = newResolutionStore(n.s, res)
+	} else {
+		view = n.s
+	}
+
+	if err = shallowCheckDependencies(view, n.params); err != nil {
 		return errMissingDependencies{
 			Func:   n.location,
 			Reason: err,
 		}
 	}
 
-	args, err := n.params.BuildList(n.s)
+	args, err := n.params.BuildList(view)
 	if err != nil {
 		return errArgumentsFailed{
 			Func:   n.location,
@@ -131,13 +156,13 @@ func (n *decoratorNode) Call(s containerStore) (err error) {
 	}
 
 	if n.callback != nil {
-		start := s.clock().Now()
+		start := view.clock().Now()
 		// Wrap in separate func to include PanicErrors
 		defer func() {
 			n.callback(CallbackInfo{
 				Name:    fmt.Sprintf("%v.%v", n.location.Package, n.location.Name),
 				Error:   err,
-				Runtime: s.clock().Since(start),
+				Runtime: view.clock().Since(start),
 			})
 		}()
 	}
@@ -153,8 +178,8 @@ func (n *decoratorNode) Call(s containerStore) (err error) {
 		}()
 	}
 
-	results := s.invoker()(reflect.ValueOf(n.dcor), args)
-	if err = n.results.ExtractList(n.s, true /* decorated */, results); err != nil {
+	results := view.invoker()(reflect.ValueOf(n.dcor), args)
+	if err = n.results.ExtractList(view, true /* decorated */, results); err != nil {
 		return err
 	}
 	n.state = decoratorCalled

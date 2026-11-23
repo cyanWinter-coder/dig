@@ -92,6 +92,10 @@ func (c *Container) Invoke(function interface{}, opts ...InvokeOption) error {
 // The function may return an error to indicate failure. The error will be
 // returned to the caller as-is.
 func (s *Scope) Invoke(function interface{}, opts ...InvokeOption) (err error) {
+	if s.IsClosed() {
+		return newErrInvalidInput("can't invoke a closed scope", nil)
+	}
+
 	ftype := reflect.TypeOf(function)
 	if ftype == nil {
 		return newErrInvalidInput("can't invoke an untyped nil", nil)
@@ -101,32 +105,52 @@ func (s *Scope) Invoke(function interface{}, opts ...InvokeOption) (err error) {
 			fmt.Sprintf("can't invoke non-function %v (type %v)", function, ftype), nil)
 	}
 
-	pl, err := newParamList(ftype, s)
+	// Fix the chain of Scopes this Invoke resolves against. Every
+	// constructor, parameter, value group, and callback involved in the
+	// Invoke uses this chain, so they all observe the same graph.
+	res := &resolution{}
+	store := newResolutionStore(s, res)
+
+	// If building the dependencies panics, undo every partial write so a
+	// Scope, its ancestors, and its siblings are left exactly as they were.
+	committed := false
+	defer func() {
+		if !committed {
+			res.rollback()
+		}
+	}()
+
+	pl, err := newParamList(ftype, store)
 	if err != nil {
 		return err
 	}
 
-	if err := shallowCheckDependencies(s, pl); err != nil {
+	if err := shallowCheckDependencies(store, pl); err != nil {
 		return errMissingDependencies{
 			Func:   digreflect.InspectFunc(function),
 			Reason: err,
 		}
 	}
 
-	if !s.isVerifiedAcyclic {
+	if !s.isVerifiedAcyclic.Load() {
 		if ok, cycle := graph.IsAcyclic(s.gh); !ok {
 			return newErrInvalidInput("cycle detected in dependency graph", s.cycleDetectedError(cycle))
 		}
-		s.isVerifiedAcyclic = true
+		s.isVerifiedAcyclic.Store(true)
 	}
 
-	args, err := pl.BuildList(s)
+	args, err := pl.BuildList(store)
 	if err != nil {
 		return errArgumentsFailed{
 			Func:   digreflect.InspectFunc(function),
 			Reason: err,
 		}
 	}
+	// The dependencies were built successfully; the values they produced
+	// are now owned by the Scope that constructed them.
+	res.commit()
+	committed = true
+
 	if s.recoverFromPanics {
 		defer func() {
 			if p := recover(); p != nil {

@@ -257,14 +257,12 @@ func (ps paramSingle) Build(c containerStore) (reflect.Value, error) {
 		return v, nil
 	}
 
-	// Starting at the given container and working our way up its parents,
-	// find one that provides this dependency.
-	//
-	// Once found, we'll use that container for the rest of the invocation.
-	// Dependencies of this type will begin searching at that container,
-	// rather than starting at base.
+	// Walk the fixed chain of Scopes for this resolution, from the
+	// requesting Scope up to the root. A value cached by an ancestor is a
+	// singleton that Scope already published, so it is reused. Otherwise,
+	// the first Scope that provides the value is asked to construct it,
+	// and the instance is owned by the Scope that triggered the call.
 	var providers []provider
-	var providingContainer containerStore
 	for _, container := range c.storesToRoot() {
 		// first check if the scope already has cached a value for the type.
 		if v, ok := container.getValue(ps.Name, ps.Type); ok {
@@ -272,7 +270,6 @@ func (ps paramSingle) Build(c containerStore) (reflect.Value, error) {
 		}
 		providers = container.getValueProviders(ps.Name, ps.Type)
 		if len(providers) > 0 {
-			providingContainer = container
 			break
 		}
 	}
@@ -285,7 +282,7 @@ func (ps paramSingle) Build(c containerStore) (reflect.Value, error) {
 	}
 
 	for _, n := range providers {
-		err := n.Call(n.OrigScope())
+		err := n.Call(c)
 		if err == nil {
 			continue
 		}
@@ -303,10 +300,14 @@ func (ps paramSingle) Build(c containerStore) (reflect.Value, error) {
 		}
 	}
 
-	// If we get here, it's impossible for the value to be absent from the
-	// container.
-	v, _ = providingContainer.getValue(ps.Name, ps.Type)
-	return v, nil
+	// The value was published into the Scope that triggered the call,
+	// which is part of the fixed chain, so it is visible from here.
+	for _, container := range c.storesToRoot() {
+		if v, ok := container.getValue(ps.Name, ps.Type); ok {
+			return v, nil
+		}
+	}
+	return _noValue, newErrMissingTypes(c, key{name: ps.Name, t: ps.Type})
 }
 
 // paramObject is a dig.In struct where each field is another param.
@@ -601,13 +602,17 @@ func (pt paramGroupedSlice) callGroupDecorators(c containerStore) error {
 // search the given container and its parent for matching group providers and
 // call them to commit values. If an error is encountered, return the number
 // of providers called and a non-nil error from the first provided.
+//
+// Providers publish into the Scope that triggered the resolution, exactly
+// like single-value providers do, so a request Scope's group elements never
+// leak into an ancestor or a sibling.
 func (pt paramGroupedSlice) callGroupProviders(c containerStore) (int, error) {
 	itemCount := 0
-	for _, c := range c.storesToRoot() {
-		providers := c.getGroupProviders(pt.Group, pt.Type.Elem())
+	for _, store := range c.storesToRoot() {
+		providers := store.getGroupProviders(pt.Group, pt.Type.Elem())
 		itemCount += len(providers)
 		for _, n := range providers {
-			if err := n.Call(n.OrigScope()); err != nil {
+			if err := n.Call(c); err != nil {
 				return 0, errParamGroupFailed{
 					CtorID: n.ID(),
 					Key:    key{group: pt.Group, t: pt.Type.Elem()},
@@ -634,19 +639,20 @@ func (pt paramGroupedSlice) Build(c containerStore) (reflect.Value, error) {
 
 	// If we do not have any decorated values and the group isn't soft,
 	// find the providers and call them.
-	itemCount := 0
 	if !pt.Soft {
-		var err error
-		itemCount, err = pt.callGroupProviders(c)
-		if err != nil {
+		if _, err := pt.callGroupProviders(c); err != nil {
 			return _noValue, err
 		}
 	}
 
-	stores := c.storesToRoot()
-	result := reflect.MakeSlice(pt.Type, 0, itemCount)
-	for _, c := range stores {
-		result = reflect.Append(result, c.getValueGroup(pt.Group, pt.Type.Elem())...)
+	// Collect the elements visible from the fixed chain. Each constructor
+	// contributes at most one element: an instance published by an ancestor
+	// is reused, and a request's own instance does not repeat a provider an
+	// ancestor already supplied.
+	items := collectGroup(c, pt.Group, pt.Type.Elem())
+	result := reflect.MakeSlice(pt.Type, 0, len(items))
+	for _, v := range items {
+		result = reflect.Append(result, v)
 	}
 	return result, nil
 }

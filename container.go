@@ -111,6 +111,11 @@ type containerStore interface {
 	// The order in which the values are returned is undefined.
 	getValueGroup(name string, t reflect.Type) []reflect.Value
 
+	// Retrieves all values for the provided group and type together with
+	// the constructor that produced each value. The two slices are aligned;
+	// a nil owner means the producer is not tracked.
+	getValueGroupWithOwners(name string, t reflect.Type) ([]reflect.Value, []*constructorNode)
+
 	// Retrieves all decorated values for the provided group and type, if any.
 	getDecoratedValueGroup(name string, t reflect.Type) (reflect.Value, bool)
 
@@ -290,12 +295,4 @@ func (bs byTypeName) Less(i int, j int) bool {
 
 func (bs byTypeName) Swap(i int, j int) {
 	bs[i], bs[j] = bs[j], bs[i]
-}
-
-func shuffledCopy(rand *rand.Rand, items []reflect.Value) []reflect.Value {
-	newItems := make([]reflect.Value, len(items))
-	for i, j := range rand.Perm(len(items)) {
-		newItems[i] = items[j]
-	}
-	return newItems
 }

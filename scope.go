@@ -26,6 +26,8 @@ import (
 	"math/rand"
 	"reflect"
 	"sort"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"go.uber.org/dig/internal/digclock"
@@ -40,8 +42,26 @@ type ScopeOption interface {
 // Scope is a scoped DAG of types and their dependencies.
 // A Scope may also have one or more child Scopes that inherit
 // from it.
+//
+// Values built while resolving a Scope belong to the Scope that triggered
+// the construction. They are cached there, are visible to that Scope and
+// its descendants, and are never published into an ancestor or a sibling
+// Scope. A failed resolution leaves every Scope exactly as it was, and a
+// closed Scope can be replaced by a new one that builds independent
+// instances.
 type Scope struct {
 	// This implements containerStore interface.
+
+	// mu guards the value caches, the record of completed constructor
+	// calls, and the closed flag. Scopes never share it with their parent:
+	// values constructed while resolving a Scope are written to that Scope
+	// only, so independent request Scopes do not contend on the same lock.
+	mu sync.RWMutex
+
+	// treeMu guards the shape of the scope tree: childScopes and the copied
+	// graph nodes. It is separate from mu so that creating a Scope does not
+	// block resolutions that only read cached values.
+	treeMu sync.RWMutex
 
 	// Name of the Scope
 	name string
@@ -65,14 +85,29 @@ type Scope struct {
 	// Values groups that generated directly in the Scope.
 	groups map[key][]reflect.Value
 
+	// Which constructor produced each element of groups, in the same order.
+	// A nil entry is used for values whose producer is not known.
+	groupOwners map[key][]*constructorNode
+
 	// Values groups that generated via decoraters in the Scope.
 	decoratedGroups map[key]reflect.Value
+
+	// Constructor calls that this Scope has completed. A constructor runs
+	// at most once per Scope: the instance it produces belongs to the
+	// Scope that triggered the call and is reused only there and by its
+	// descendants.
+	calls map[*constructorNode]struct{}
+
+	// closed is set by Close. A closed Scope keeps its graph, but it no
+	// longer accepts new values or resolutions, and the values it cached
+	// are released. A new Scope must be created for the next request.
+	closed bool
 
 	// Source of randomness.
 	rand *rand.Rand
 
 	// Flag indicating whether the graph has been checked for cycles.
-	isVerifiedAcyclic bool
+	isVerifiedAcyclic atomic.Bool
 
 	// Defer acyclic check on provide until Invoke.
 	deferAcyclicVerification bool
@@ -104,7 +139,9 @@ func newScope() *Scope {
 		values:          make(map[key]reflect.Value),
 		decoratedValues: make(map[key]reflect.Value),
 		groups:          make(map[key][]reflect.Value),
+		groupOwners:     make(map[key][]*constructorNode),
 		decoratedGroups: make(map[key]reflect.Value),
+		calls:           make(map[*constructorNode]struct{}),
 		invokerFn:       defaultInvoker,
 		rand:            rand.New(rand.NewSource(time.Now().UnixNano())),
 		clockSrc:        digclock.System,
@@ -119,6 +156,7 @@ func newScope() *Scope {
 // However, no modifications made to the child scope being created will be propagated
 // to the parent Scope.
 func (s *Scope) Scope(name string, opts ...ScopeOption) *Scope {
+	s.treeMu.RLock()
 	child := newScope()
 	child.name = name
 	child.parentScope = s
@@ -134,12 +172,15 @@ func (s *Scope) Scope(name string, opts ...ScopeOption) *Scope {
 			ctrNode.CopyOrder(s, child)
 		}
 	}
+	s.treeMu.RUnlock()
 
 	for _, opt := range opts {
 		opt.noScopeOption()
 	}
 
+	s.treeMu.Lock()
 	s.childScopes = append(s.childScopes, child)
+	s.treeMu.Unlock()
 	return child
 }
 
@@ -155,7 +196,11 @@ func (s *Scope) ancestors() []*Scope {
 
 func (s *Scope) appendSubscopes(dest []*Scope) []*Scope {
 	dest = append(dest, s)
-	for _, cs := range s.childScopes {
+	s.treeMu.RLock()
+	children := make([]*Scope, len(s.childScopes))
+	copy(children, s.childScopes)
+	s.treeMu.RUnlock()
+	for _, cs := range children {
 		dest = cs.appendSubscopes(dest)
 	}
 	return dest
@@ -170,10 +215,17 @@ func (s *Scope) storesToRoot() []containerStore {
 	return stores
 }
 
+// knownTypes returns all known types visible from this Scope. It walks the
+// Scope chain so that a resolution against a fixed chain sees the same set of
+// types that its providers were registered in.
 func (s *Scope) knownTypes() []reflect.Type {
-	typeSet := make(map[reflect.Type]struct{}, len(s.providers))
-	for k := range s.providers {
-		typeSet[k.t] = struct{}{}
+	typeSet := make(map[reflect.Type]struct{})
+	for _, scope := range s.ancestors() {
+		scope.mu.RLock()
+		for k := range scope.providers {
+			typeSet[k.t] = struct{}{}
+		}
+		scope.mu.RUnlock()
 	}
 
 	types := make([]reflect.Type, 0, len(typeSet))
@@ -185,42 +237,203 @@ func (s *Scope) knownTypes() []reflect.Type {
 }
 
 func (s *Scope) getValue(name string, t reflect.Type) (v reflect.Value, ok bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	v, ok = s.values[key{name: name, t: t}]
 	return
 }
 
 func (s *Scope) getDecoratedValue(name string, t reflect.Type) (v reflect.Value, ok bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	v, ok = s.decoratedValues[key{name: name, t: t}]
 	return
 }
 
 func (s *Scope) setValue(name string, t reflect.Type, v reflect.Value) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.values[key{name: name, t: t}] = v
 }
 
 func (s *Scope) setDecoratedValue(name string, t reflect.Type, v reflect.Value) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.decoratedValues[key{name: name, t: t}] = v
 }
 
 func (s *Scope) getValueGroup(name string, t reflect.Type) []reflect.Value {
-	items := s.groups[key{group: name, t: t}]
-	// shuffle the list so users don't rely on the ordering of grouped values
-	return shuffledCopy(s.rand, items)
+	items, _ := s.getValueGroupWithOwners(name, t)
+	return items
+}
+
+// getValueGroupWithOwners returns a shuffled copy of this Scope's value group
+// together with the constructor that produced each element. The two slices
+// are aligned: owners[i] produced items[i], before shuffling. A nil owner
+// means the producer is not tracked.
+func (s *Scope) getValueGroupWithOwners(name string, t reflect.Type) ([]reflect.Value, []*constructorNode) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	k := key{group: name, t: t}
+	items := s.groups[k]
+	owners := s.groupOwners[k]
+
+	perm := s.rand.Perm(len(items))
+	newItems := make([]reflect.Value, len(items))
+	newOwners := make([]*constructorNode, len(owners))
+	for i, j := range perm {
+		newItems[i] = items[j]
+		if j < len(owners) {
+			newOwners[i] = owners[j]
+		}
+	}
+	return newItems, newOwners
 }
 
 func (s *Scope) getDecoratedValueGroup(name string, t reflect.Type) (reflect.Value, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	items, ok := s.decoratedGroups[key{group: name, t: t}]
 	return items, ok
 }
 
 func (s *Scope) submitGroupedValue(name string, t reflect.Type, v reflect.Value) {
+	s.submitGroupedValueFrom(nil, name, t, v)
+}
+
+// submitGroupedValueFrom records v in this Scope's value group together with
+// the constructor that produced it. The owner lets a later resolution collect
+// each provider's element exactly once, even when the same provider also
+// contributed an element further up the chain.
+func (s *Scope) submitGroupedValueFrom(n *constructorNode, name string, t reflect.Type, v reflect.Value) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	k := key{group: name, t: t}
 	s.groups[k] = append(s.groups[k], v)
+	s.groupOwners[k] = append(s.groupOwners[k], n)
 }
 
 func (s *Scope) submitDecoratedGroupedValue(name string, t reflect.Type, v reflect.Value) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	k := key{group: name, t: t}
 	s.decoratedGroups[k] = v
+}
+
+// lookupValue returns the cached value for k and whether it was present. It
+// is used to capture an undo step.
+func (s *Scope) lookupValue(k key) (reflect.Value, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	v, ok := s.values[k]
+	return v, ok
+}
+
+func (s *Scope) restoreValue(k key, v reflect.Value, ok bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if ok {
+		s.values[k] = v
+	} else {
+		delete(s.values, k)
+	}
+}
+
+func (s *Scope) lookupDecoratedValue(k key) (reflect.Value, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	v, ok := s.decoratedValues[k]
+	return v, ok
+}
+
+func (s *Scope) restoreDecoratedValue(k key, v reflect.Value, ok bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if ok {
+		s.decoratedValues[k] = v
+	} else {
+		delete(s.decoratedValues, k)
+	}
+}
+
+func (s *Scope) lookupGroup(k key) (groupSnapshot, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	values, ok := s.groups[k]
+	if !ok {
+		return groupSnapshot{}, false
+	}
+	owners := s.groupOwners[k]
+	snap := groupSnapshot{
+		values: append([]reflect.Value(nil), values...),
+		owners: append([]*constructorNode(nil), owners...),
+	}
+	return snap, true
+}
+
+func (s *Scope) restoreGroup(k key, snap groupSnapshot, ok bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if ok {
+		s.groups[k] = snap.values
+		s.groupOwners[k] = snap.owners
+	} else {
+		delete(s.groups, k)
+		delete(s.groupOwners, k)
+	}
+}
+
+// groupSnapshot is a point-in-time copy of a value group and its owners.
+type groupSnapshot struct {
+	values []reflect.Value
+	owners []*constructorNode
+}
+
+func (s *Scope) lookupDecoratedGroup(k key) (reflect.Value, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	v, ok := s.decoratedGroups[k]
+	return v, ok
+}
+
+func (s *Scope) restoreDecoratedGroup(k key, v reflect.Value, ok bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if ok {
+		s.decoratedGroups[k] = v
+	} else {
+		delete(s.decoratedGroups, k)
+	}
+}
+
+// hasCalled reports whether this Scope already constructed the value
+// produced by n.
+func (s *Scope) hasCalled(n *constructorNode) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	_, ok := s.calls[n]
+	return ok
+}
+
+// markCalled records that this Scope constructed the value produced by n.
+// It reports false if the call was already recorded.
+func (s *Scope) markCalled(n *constructorNode) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.calls[n]; ok {
+		return false
+	}
+	s.calls[n] = struct{}{}
+	return true
+}
+
+// forgetCall removes a recorded call. It is used to roll back a failed
+// resolution.
+func (s *Scope) forgetCall(n *constructorNode) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.calls, n)
 }
 
 func (s *Scope) getValueProviders(name string, t reflect.Type) []provider {
@@ -240,11 +453,15 @@ func (s *Scope) getGroupDecorator(name string, t reflect.Type) (decorator, bool)
 }
 
 func (s *Scope) getDecorators(k key) (decorator, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	d, found := s.decorators[k]
 	return d, found
 }
 
 func (s *Scope) getProviders(k key) []provider {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	nodes := s.providers[k]
 	providers := make([]provider, len(nodes))
 	for i, n := range nodes {
@@ -282,9 +499,60 @@ func (s *Scope) clock() digclock.Clock {
 // scope.
 func (s *Scope) newGraphNode(wrapped interface{}, orders map[*Scope]int) {
 	orders[s] = s.gh.NewNode(wrapped)
-	for _, cs := range s.childScopes {
+	s.treeMu.RLock()
+	children := make([]*Scope, len(s.childScopes))
+	copy(children, s.childScopes)
+	s.treeMu.RUnlock()
+	for _, cs := range children {
 		cs.newGraphNode(wrapped, orders)
 	}
+}
+
+// Close releases the values cached in this Scope.
+//
+// A request that used this Scope is over: the instances it constructed are
+// no longer reachable through this Scope, and a new Scope must be created
+// for the next request. Closing does not modify the parent Scope or sibling
+// Scopes, so they keep serving the instances they already own.
+//
+// Close is idempotent. Invoking a closed Scope returns an error rather than
+// stale instances, and a new Scope created from the same parent builds
+// independent instances.
+func (s *Scope) Close() error {
+	s.mu.Lock()
+	alreadyClosed := s.closed
+	s.closed = true
+	if !alreadyClosed {
+		s.values = make(map[key]reflect.Value)
+		s.decoratedValues = make(map[key]reflect.Value)
+		s.groups = make(map[key][]reflect.Value)
+		s.groupOwners = make(map[key][]*constructorNode)
+		s.decoratedGroups = make(map[key]reflect.Value)
+		s.calls = make(map[*constructorNode]struct{})
+	}
+	s.mu.Unlock()
+
+	// Detach the closed Scope from its parent so nothing can reach it
+	// through the tree again. The parent's providers, graph, and cached
+	// values are left untouched.
+	if parent := s.parentScope; parent != nil {
+		parent.treeMu.Lock()
+		for i, child := range parent.childScopes {
+			if child == s {
+				parent.childScopes = append(parent.childScopes[:i], parent.childScopes[i+1:]...)
+				break
+			}
+		}
+		parent.treeMu.Unlock()
+	}
+	return nil
+}
+
+// IsClosed reports whether Close was called on this Scope.
+func (s *Scope) IsClosed() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.closed
 }
 
 func (s *Scope) cycleDetectedError(cycle []int) error {
@@ -314,6 +582,10 @@ func (s *Scope) rootScope() *Scope {
 // String representation of the entire Scope
 func (s *Scope) String() string {
 	b := &bytes.Buffer{}
+
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
 	fmt.Fprintln(b, "nodes: {")
 	for k, vs := range s.providers {
 		for _, v := range vs {
