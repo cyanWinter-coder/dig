@@ -20,7 +20,11 @@
 
 package dig
 
-import "go.uber.org/dig/internal/graph"
+import (
+	"sync"
+
+	"go.uber.org/dig/internal/graph"
+)
 
 // graphNode is a single node in the dependency graph.
 type graphNode struct {
@@ -33,6 +37,11 @@ type graphNode struct {
 // It implements the graph interface defined by internal/graph.
 // It has 1-1 correspondence with the Scope whose graph it represents.
 type graphHolder struct {
+	// mu guards nodes and snap. Nodes may be appended at resolution time
+	// (e.g. value group parameters register graph nodes while building),
+	// so concurrent Invokes must synchronize their access.
+	mu sync.RWMutex
+
 	// all the nodes defined in the graph.
 	nodes []*graphNode
 
@@ -50,7 +59,11 @@ func newGraphHolder(s *Scope) *graphHolder {
 	return &graphHolder{s: s, snap: -1}
 }
 
-func (gh *graphHolder) Order() int { return len(gh.nodes) }
+func (gh *graphHolder) Order() int {
+	gh.mu.RLock()
+	defer gh.mu.RUnlock()
+	return len(gh.nodes)
+}
 
 // EdgesFrom returns the indices of nodes that are dependencies of node u.
 //
@@ -79,6 +92,8 @@ func (gh *graphHolder) EdgesFrom(u int) []int {
 
 // NewNode adds a new value to the graph and returns its order.
 func (gh *graphHolder) NewNode(wrapped interface{}) int {
+	gh.mu.Lock()
+	defer gh.mu.Unlock()
 	order := len(gh.nodes)
 	gh.nodes = append(gh.nodes, &graphNode{
 		Wrapped: wrapped,
@@ -89,6 +104,8 @@ func (gh *graphHolder) NewNode(wrapped interface{}) int {
 // Lookup retrieves the value for the node with the given order.
 // Lookup panics if i is invalid.
 func (gh *graphHolder) Lookup(i int) interface{} {
+	gh.mu.RLock()
+	defer gh.mu.RUnlock()
 	return gh.nodes[i].Wrapped
 }
 
@@ -98,12 +115,16 @@ func (gh *graphHolder) Lookup(i int) interface{} {
 // Only one snapshot is allowed at a time.
 // Multiple calls to snapshot will overwrite prior snapshots.
 func (gh *graphHolder) Snapshot() {
+	gh.mu.Lock()
+	defer gh.mu.Unlock()
 	gh.snap = len(gh.nodes)
 }
 
 // Rollback rolls back a snapshot to a previously captured state.
 // This is a no-op if no snapshot was captured.
 func (gh *graphHolder) Rollback() {
+	gh.mu.Lock()
+	defer gh.mu.Unlock()
 	if gh.snap < 0 {
 		return
 	}

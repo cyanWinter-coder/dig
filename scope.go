@@ -26,6 +26,8 @@ import (
 	"math/rand"
 	"reflect"
 	"sort"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"go.uber.org/dig/internal/digclock"
@@ -68,11 +70,17 @@ type Scope struct {
 	// Values groups that generated via decoraters in the Scope.
 	decoratedGroups map[key]reflect.Value
 
+	// storeMu guards the value stores above (values, decoratedValues,
+	// groups, decoratedGroups) as well as rand, so that concurrent
+	// resolutions committing to or reading from this Scope observe a
+	// consistent view of the container.
+	storeMu sync.RWMutex
+
 	// Source of randomness.
 	rand *rand.Rand
 
 	// Flag indicating whether the graph has been checked for cycles.
-	isVerifiedAcyclic bool
+	isVerifiedAcyclic atomic.Bool
 
 	// Defer acyclic check on provide until Invoke.
 	deferAcyclicVerification bool
@@ -185,40 +193,58 @@ func (s *Scope) knownTypes() []reflect.Type {
 }
 
 func (s *Scope) getValue(name string, t reflect.Type) (v reflect.Value, ok bool) {
+	s.storeMu.RLock()
+	defer s.storeMu.RUnlock()
 	v, ok = s.values[key{name: name, t: t}]
 	return
 }
 
 func (s *Scope) getDecoratedValue(name string, t reflect.Type) (v reflect.Value, ok bool) {
+	s.storeMu.RLock()
+	defer s.storeMu.RUnlock()
 	v, ok = s.decoratedValues[key{name: name, t: t}]
 	return
 }
 
 func (s *Scope) setValue(name string, t reflect.Type, v reflect.Value) {
+	s.storeMu.Lock()
+	defer s.storeMu.Unlock()
 	s.values[key{name: name, t: t}] = v
 }
 
 func (s *Scope) setDecoratedValue(name string, t reflect.Type, v reflect.Value) {
+	s.storeMu.Lock()
+	defer s.storeMu.Unlock()
 	s.decoratedValues[key{name: name, t: t}] = v
 }
 
 func (s *Scope) getValueGroup(name string, t reflect.Type) []reflect.Value {
+	// Take the write lock: shuffling reads and mutates the shared
+	// randomness source, which is not safe for concurrent use.
+	s.storeMu.Lock()
+	defer s.storeMu.Unlock()
 	items := s.groups[key{group: name, t: t}]
 	// shuffle the list so users don't rely on the ordering of grouped values
 	return shuffledCopy(s.rand, items)
 }
 
 func (s *Scope) getDecoratedValueGroup(name string, t reflect.Type) (reflect.Value, bool) {
+	s.storeMu.RLock()
+	defer s.storeMu.RUnlock()
 	items, ok := s.decoratedGroups[key{group: name, t: t}]
 	return items, ok
 }
 
 func (s *Scope) submitGroupedValue(name string, t reflect.Type, v reflect.Value) {
+	s.storeMu.Lock()
+	defer s.storeMu.Unlock()
 	k := key{group: name, t: t}
 	s.groups[k] = append(s.groups[k], v)
 }
 
 func (s *Scope) submitDecoratedGroupedValue(name string, t reflect.Type, v reflect.Value) {
+	s.storeMu.Lock()
+	defer s.storeMu.Unlock()
 	k := key{group: name, t: t}
 	s.decoratedGroups[k] = v
 }
@@ -323,6 +349,7 @@ func (s *Scope) String() string {
 	fmt.Fprintln(b, "}")
 
 	fmt.Fprintln(b, "values: {")
+	s.storeMu.RLock()
 	for k, v := range s.values {
 		fmt.Fprintln(b, "\t", k, "=>", v)
 	}
@@ -331,6 +358,7 @@ func (s *Scope) String() string {
 			fmt.Fprintln(b, "\t", k, "=>", v)
 		}
 	}
+	s.storeMu.RUnlock()
 	fmt.Fprintln(b, "}")
 
 	return b.String()

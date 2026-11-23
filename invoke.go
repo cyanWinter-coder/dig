@@ -113,11 +113,11 @@ func (s *Scope) Invoke(function interface{}, opts ...InvokeOption) (err error) {
 		}
 	}
 
-	if !s.isVerifiedAcyclic {
+	if !s.isVerifiedAcyclic.Load() {
 		if ok, cycle := graph.IsAcyclic(s.gh); !ok {
 			return newErrInvalidInput("cycle detected in dependency graph", s.cycleDetectedError(cycle))
 		}
-		s.isVerifiedAcyclic = true
+		s.isVerifiedAcyclic.Store(true)
 	}
 
 	args, err := pl.BuildList(s)

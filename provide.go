@@ -499,7 +499,7 @@ func (s *Scope) provide(ctor interface{}, opts provideOptions) (err error) {
 	}
 
 	for _, s := range allScopes {
-		s.isVerifiedAcyclic = false
+		s.isVerifiedAcyclic.Store(false)
 		if s.deferAcyclicVerification {
 			continue
 		}
@@ -513,7 +513,7 @@ func (s *Scope) provide(ctor interface{}, opts provideOptions) (err error) {
 
 			return newErrInvalidInput("this function introduces a cycle", s.cycleDetectedError(cycle))
 		}
-		s.isVerifiedAcyclic = true
+		s.isVerifiedAcyclic.Store(true)
 	}
 
 	s.nodes = append(s.nodes, n)

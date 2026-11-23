@@ -222,12 +222,16 @@ func (ps paramSingle) buildWithDecorators(c containerStore) (v reflect.Value, fo
 		if d, found = s.getValueDecorator(ps.Name, ps.Type); !found {
 			continue
 		}
-		if d.State() == decoratorOnStack {
-			// This decorator is already being run.
+		if d.OnStack() {
+			// This decorator is already being run by this goroutine.
 			// Avoid a cycle and look further.
 			d = nil
 			continue
 		}
+		// If the decorator is currently being run by another goroutine,
+		// wait for it to reach its terminal state so that this resolution
+		// observes the decorated value rather than racing past it.
+		d.Wait()
 		decoratingScope = s
 		break
 	}
@@ -581,11 +585,14 @@ func (pt paramGroupedSlice) callGroupDecorators(c containerStore) error {
 	for i := len(stores) - 1; i >= 0; i-- {
 		c := stores[i]
 		if d, found := c.getGroupDecorator(pt.Group, pt.Type.Elem()); found {
-			if d.State() == decoratorOnStack {
-				// This decorator is already being run. Avoid cycle
-				// and look further.
+			if d.OnStack() {
+				// This decorator is already being run by this goroutine.
+				// Avoid cycle and look further.
 				continue
 			}
+			// If the decorator is currently being run by another
+			// goroutine, wait for it to reach its terminal state.
+			d.Wait()
 			if err := d.Call(c); err != nil {
 				return errParamGroupFailed{
 					CtorID: d.ID(),

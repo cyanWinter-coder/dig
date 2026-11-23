@@ -23,6 +23,8 @@ package dig
 import (
 	"fmt"
 	"reflect"
+	"sync"
+	"sync/atomic"
 
 	"go.uber.org/dig/internal/digreflect"
 	"go.uber.org/dig/internal/dot"
@@ -40,6 +42,16 @@ type decorator interface {
 	Call(c containerStore) error
 	ID() dot.CtorID
 	State() decoratorState
+
+	// OnStack reports whether this decorator is currently being run by
+	// the calling goroutine, i.e. it is already on this goroutine's
+	// resolution stack.
+	OnStack() bool
+
+	// Wait blocks until any in-flight Call to this decorator on another
+	// goroutine reaches its terminal state. It is a no-op if the
+	// decorator is not currently running.
+	Wait()
 }
 
 type decoratorNode struct {
@@ -51,8 +63,21 @@ type decoratorNode struct {
 	// Location where this function was defined.
 	location *digreflect.Func
 
-	// Current state of this decorator
-	state decoratorState
+	// Current state of this decorator.
+	// Stored as an atomic so that State may be read without holding mu:
+	// Call inspects the state of other decorators while holding its own
+	// mu, so guarding State with mu would self-deadlock.
+	state atomic.Int32
+
+	// owner is the ID of the goroutine currently running this decorator,
+	// or -1 if it is not running. It lets concurrent resolutions tell a
+	// decorator that is on their own stack apart from one that is merely
+	// in flight on another goroutine.
+	owner atomic.Int64
+
+	// mu serializes calls to Call so that the decorator runs at most once
+	// even when multiple goroutines resolve decorated values concurrently.
+	mu sync.Mutex
 
 	// Parameters of the decorator.
 	params paramList
@@ -100,15 +125,39 @@ func newDecoratorNode(dcor interface{}, s *Scope, opts decorateOptions) (*decora
 		callback:       opts.Callback,
 		beforeCallback: opts.BeforeCallback,
 	}
+	n.owner.Store(-1)
 	return n, nil
 }
 
+// Call runs this decorator if it hasn't already been called and commits
+// the decorated values it produces to the container.
+//
+// Call is safe for concurrent use: the mutex held for the duration of the
+// call is the commit boundary for this decorator. Exactly one terminal
+// state is published per call — on success the staged decorated values
+// are committed and the state becomes decoratorCalled; on failure or
+// panic nothing is committed and the state returns to decoratorReady so
+// the decoration may be retried by a later caller. Concurrent callers
+// block until the in-flight call reaches its terminal state.
 func (n *decoratorNode) Call(s containerStore) (err error) {
-	if n.state == decoratorCalled {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+
+	if n.State() == decoratorCalled {
 		return nil
 	}
 
-	n.state = decoratorOnStack
+	n.setState(decoratorOnStack)
+	n.owner.Store(curGID())
+	defer func() {
+		if err != nil {
+			// The decoration did not complete: nothing was committed, so
+			// reset to the ready state and let a later call retry it
+			// rather than caching the failure.
+			n.setState(decoratorReady)
+		}
+		n.owner.Store(-1)
+	}()
 
 	if err := shallowCheckDependencies(s, n.params); err != nil {
 		return errMissingDependencies{
@@ -153,17 +202,37 @@ func (n *decoratorNode) Call(s containerStore) (err error) {
 		}()
 	}
 
+	// Stage the decorated values and commit them only if every result was
+	// extracted successfully, so a failed decoration never leaves a
+	// partially committed value in the container.
+	receiver := newStagingContainerWriter()
 	results := s.invoker()(reflect.ValueOf(n.dcor), args)
-	if err = n.results.ExtractList(n.s, true /* decorated */, results); err != nil {
+	if err = n.results.ExtractList(receiver, true /* decorated */, results); err != nil {
 		return err
 	}
-	n.state = decoratorCalled
+	receiver.Commit(n.s)
+	n.setState(decoratorCalled)
 	return nil
 }
 
 func (n *decoratorNode) ID() dot.CtorID { return n.id }
 
-func (n *decoratorNode) State() decoratorState { return n.state }
+func (n *decoratorNode) State() decoratorState { return decoratorState(n.state.Load()) }
+
+func (n *decoratorNode) setState(s decoratorState) { n.state.Store(int32(s)) }
+
+// OnStack reports whether this decorator is currently being run by the
+// calling goroutine.
+func (n *decoratorNode) OnStack() bool {
+	return n.State() == decoratorOnStack && n.owner.Load() == curGID()
+}
+
+// Wait blocks until any in-flight Call to this decorator on another
+// goroutine reaches its terminal state.
+func (n *decoratorNode) Wait() {
+	n.mu.Lock()
+	n.mu.Unlock()
+}
 
 // DecorateOption modifies the default behavior of Decorate.
 type DecorateOption interface {
